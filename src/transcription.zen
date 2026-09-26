@@ -1,5 +1,5 @@
-// Background inference uses Zen actors. A bounded pipe carries the result back
-// to the UI without files, polling an actor's private state, or native wrappers.
+// Inference sends typed messages to the result actor. A bounded pipe bridges
+// that actor to AppKit's main thread; neither actor touches UI state.
 Recognizer, NativeError = parakeet
 Ptr, null_ptr = std.mem
 str_at = std.text
@@ -21,8 +21,9 @@ Polling = c.bind("poll.h", "poll", {
 MailboxError* = OpenFailed | ReadFailed | Closed
 Transcript* = { success*: bool, text*: str }
 
-// Only the worker writes. The UI admits one job until its complete reply has
-// arrived. A reply is one status byte, at most 4000 text bytes, then NUL.
+// The UI admits one job until its complete reply arrives. The result actor
+// writes that reply; rejected result admission uses the worker error fallback.
+// A reply is one status byte, at most 4000 text bytes, then NUL.
 // This macOS app relies on Darwin's pipe buffer holding the one 4002-byte reply
 // during close/join. PIPE_BUF is an atomicity limit, not that buffer's capacity;
 // a single writer plus partial-read framing does not require an atomic record.
@@ -41,7 +42,7 @@ write_all = (fd: i32, text: str) bool {
     good
 }
 
-reply = (fd: i32, success: bool, text: str) () {
+write_reply = (fd: i32, success: bool, text: str) () {
     length ::= text.len;
     (length > 4000).then(() {
         length = 4000;
@@ -54,8 +55,29 @@ reply = (fd: i32, success: bool, text: str) () {
     });
 }
 
+// Serialize actor results for the main-thread UI. Message text is copied by
+// the actor runtime, so the inference scratch arena can be released immediately.
+Results = { output: i32 }
+Results.impl(Actor, {
+    deliver = (self :: @Self, ctx: Context, success: bool, text: str) {
+        write_reply(self.output, success, text);
+    }
+})
+
+reply = (results: Ref<Results>, fallback: i32, success: bool, text: str) () {
+    results.deliver(success, text).match({
+        Ok(_)  => (),
+        Err(_) => write_reply(
+            fallback,
+            false,
+            "Cannot enqueue transcription result."
+        ),
+    });
+}
+
 Worker = {
-    output: i32,
+    results: Ref<Results>,
+    fallback: i32,
     recognizer :: Res<Recognizer>,
 }
 
@@ -68,12 +90,14 @@ Worker.impl(Actor, {
                     Ok(recognizer) => { self.recognizer = Ok(recognizer); },
                     Err(error)     => error.match({
                         NativeError(detail) => reply(
-                            self.output,
+                            self.results,
+                            self.fallback,
                             false,
                             detail.message.view()
                         ),
                         _                   => reply(
-                            self.output,
+                            self.results,
+                            self.fallback,
                             false,
                             "Cannot load Parakeet model."
                         ),
@@ -90,7 +114,8 @@ Worker.impl(Actor, {
                 count = pcm.len / 4;
                 scratch.realloc<f32>(null_ptr<f32>(), count).match({
                     Err(_)      => reply(
-                        self.output,
+                        self.results,
+                        self.fallback,
                         false,
                         "Cannot allocate audio buffer."
                     ),
@@ -102,15 +127,22 @@ Worker.impl(Actor, {
                             count,
                             rate
                         ).match({
-                            Ok(text)   => reply(self.output, true, text.view()),
+                            Ok(text)   => reply(
+                                self.results,
+                                self.fallback,
+                                true,
+                                text.view()
+                            ),
                             Err(error) => error.match({
                                 NativeError(detail) => reply(
-                                    self.output,
+                                    self.results,
+                                    self.fallback,
                                     false,
                                     detail.message.view()
                                 ),
                                 _                   => reply(
-                                    self.output,
+                                    self.results,
+                                    self.fallback,
                                     false,
                                     "Parakeet transcription failed."
                                 ),
@@ -135,6 +167,7 @@ Worker.impl(Actor, {
 // handle. close drains the worker: native inference does not support cancellation.
 Transcriber* = {
     worker: Ref<Worker>,
+    results: Ref<Results>,
     input :: i32,
     output :: i32,
     descriptor: Ptr<PollFd>,
@@ -153,17 +186,31 @@ Transcriber* = {
         input  = descriptors.read(0);
         output = descriptors.read(1);
         descriptor.write(0, PollFd(fd: input, events: 1, returned: 0));
-        env.spawn(Worker(output: output, recognizer: None)).match({
-          Err(error) => { Posix.close(input); Posix.close(output); Err(error) },
-          Ok(worker) => Ok(Transcriber(
-              worker: worker,
-              input: input,
-              output: output,
-              descriptor: descriptor,
-              buffer: buffer,
-              used: 0,
-              busy: false
-          )),
+        env.spawn(Results(output: output)).match({
+            Err(error)  => { Posix.close(input); Posix.close(output); Err(error) },
+            Ok(results) => env.spawn(Worker(
+                results: results,
+                fallback: output,
+                recognizer: None
+            )).match({
+                Err(error) => {
+                    results.stop();
+                    results.join();
+                    Posix.close(input);
+                    Posix.close(output);
+                    Err(error)
+                },
+                Ok(worker) => Ok(Transcriber(
+                    worker: worker,
+                    results: results,
+                    input: input,
+                    output: output,
+                    descriptor: descriptor,
+                    buffer: buffer,
+                    used: 0,
+                    busy: false
+                )),
+            }),
         })
     }
 
@@ -232,6 +279,8 @@ Transcriber* = {
         (self.input >= 0).then(() {
             self.worker.stop();
             self.worker.join();
+            self.results.stop();
+            self.results.join();
             Posix.close(self.input);
             Posix.close(self.output);
             self.input  = -1;

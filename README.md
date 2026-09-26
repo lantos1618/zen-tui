@@ -87,3 +87,14 @@ Metal clears/presents frames; Core Animation renders text and bars. FFT is
 scalar Zen with a Hann window and 32 linear frequency bands, displayed over a
 60 dB amplitude range. FPS counts frame submissions, not GPU completions. This
 is not yet a PTY terminal emulator, custom GPU glyph renderer, or SIMD library.
+
+## Actor messages
+
+The UI sends copied PCM and model configuration to the inference actor. That
+actor sends a typed `deliver(success: bool, text: str)` message to the result
+actor; the runtime copies the text before inference scratch storage expires.
+The result actor bridges its messages to AppKit's main thread through the
+bounded nonblocking pipe mailbox. Neither actor touches window state. A rejected
+result-message admission reports an error through the bridge instead of leaving
+the UI waiting. Shutdown drains inference, then result delivery, then closes
+the pipe. A general main-thread actor executor is not implemented yet.
