@@ -1,0 +1,29 @@
+Builder, BuildError = std.build
+
+build = (b :: Builder) Res<(), BuildError> {
+    macos    = b.lib("macos", {
+        src: Path("../zen-macos/src/macos.zen"),
+        libs: ["objc"],
+        paths: [],
+    }).try();
+    audio    = b.lib(
+        "audio",
+        {src: Path("../zen-audio/src/audio.zen"), libs: [], paths: []}
+    ).try();
+    parakeet = b.lib("parakeet", {
+        src: Path("../zen-parakeet/src/parakeet.zen"),
+        libs: ["nemo_speech_asr_c"],
+        paths: ["../zen-parakeet/build/nemo-speech/lib"],
+    }).try();
+    b.exe("zen-tui", {
+        src: Path("src/main.zen"),
+        deps: [macos, audio, parakeet],
+        language: "objective-c",
+        frameworks: [
+            "AppKit", "Foundation", "QuartzCore", "Metal", "AVFoundation",
+            "AudioToolbox", "CoreFoundation"
+        ],
+        out: Ok(Path("app/ZenTUI.app/Contents/MacOS/ZenTUI")),
+    }).try();
+    Ok(())
+}

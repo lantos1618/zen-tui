@@ -1,0 +1,91 @@
+Transcriber, Transcript = transcription
+Ptr, null_ptr = std.mem
+Audio, decode = parakeet.wav
+C = c.bind("unistd.h", { usleep* = (micros: u32) i32 })
+
+exercise = (
+    env            : Env,
+    a              : Alloc,
+    model          : str,
+    samples        : Ptr<f32>,
+    count          : usize,
+    rate           : i32,
+    expect_success : bool
+) i32 {
+    Transcriber.open(env, a).match({
+        Err(_)     => 2,
+        Ok(opened) => {
+            session ::= opened;
+            accepted  = session.submit(
+                model,
+                -1,
+                samples,
+                count,
+                rate
+            ).match({ Ok(value) => value, Err(_) => false });
+            duplicate = session.submit(
+                model,
+                -1,
+                samples,
+                count,
+                rate
+            ).match({ Ok(value) => value, Err(_) => true });
+            result   ::= 3;
+            done     ::= !accepted || duplicate;
+            attempts ::= 0;
+            loop(!done && attempts < 120000, (h) {
+                session.poll().match({
+                    Err(_)    => { result = 4; done = true; },
+                    Ok(reply) => reply.match({
+                        None     => (),
+                        Ok(text) => {
+                            println("{}", text.text);
+                            result = (text.success == expect_success && !session.busy).match({true => 0, false => 5});
+                            done   = true;
+                        },
+                    }),
+                });
+                C.usleep(1000);
+                attempts = attempts + 1;
+            });
+            // Both poll-after-completion and repeated close must be harmless.
+            session.poll().match({
+                Ok(None) => (),
+                _        => { result = 6; },
+            });
+            session.close();
+            session.close();
+            result
+        },
+    })
+}
+
+main = (env: Env) Res<i32, AllocError> {
+    a ::= env.mem.alloc();
+    model = env.argv.get(
+        1
+    ).match({Ok(path) => path, None => "/missing/zen-transcription-fixture.gguf"});
+    wav   = env.argv.get(2).match({Ok(path) => path, None => ""});
+    (wav.len > 0).match({
+        true  => env.fs.read(a, wav).match({
+            Err(_)    => Ok(7),
+            Ok(bytes) => decode(a, bytes.view()).match({
+                Err(_)    => Ok(8),
+                Ok(audio) => Ok(exercise(
+                    env,
+                    a,
+                    model,
+                    audio.samples,
+                    audio.count,
+                    audio.rate,
+                    true
+                )),
+            }),
+        }),
+        false => {
+            samples = a.realloc<f32>(null_ptr<f32>(), 16000).try();
+            Range(0, 16000).loop((i) { samples.write(i, 0.0); });
+            Ok(exercise(env, a, model, samples, 16000, 16000, false))
+        },
+    })
+}

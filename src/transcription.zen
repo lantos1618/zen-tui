@@ -1,0 +1,242 @@
+// Background inference uses Zen actors. A bounded pipe carries the result back
+// to the UI without files, polling an actor's private state, or native wrappers.
+Recognizer, NativeError = parakeet
+Ptr, null_ptr = std.mem
+str_at = std.text
+
+Posix = c.bind("unistd.h", {
+    pipe* = (descriptors: Ptr<i32>) i32
+    // The header supplies ssize_t; C's result conversion maps -1 to usize.MAX.
+    // Every count is bounded before use, so the sentinel cannot be a byte count.
+    read* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
+    write* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
+    close* = (fd: i32) i32
+})
+Errors = c.bind("errno.h", { __error* = () Ptr<i32> })
+PollFd = { fd: i32, events: i16, returned: i16 }
+Polling = c.bind("poll.h", "poll", {
+    ready* = (descriptors: Ptr<PollFd>, count: u32, timeout: i32) i32
+})
+
+MailboxError* = OpenFailed | ReadFailed | Closed
+Transcript* = { success*: bool, text*: str }
+
+// Only the worker writes. The UI admits one job until its complete reply has
+// arrived. A reply is one status byte, at most 4000 text bytes, then NUL.
+// This macOS app relies on Darwin's pipe buffer holding the one 4002-byte reply
+// during close/join. PIPE_BUF is an atomicity limit, not that buffer's capacity;
+// a single writer plus partial-read framing does not require an atomic record.
+write_all = (fd: i32, text: str) bool {
+    offset ::= 0;
+    good   ::= true;
+    loop(good && offset < text.len, (h) {
+        count = Posix.write(fd, text.ptr().offset(offset), text.len - offset);
+        (count > 0 && count <= text.len - offset).match({
+            true  => { offset = offset + count; },
+            false => { good = count == usize.MAX && Errors.__error().read(
+                0
+            ) == 4; },
+        });
+    });
+    good
+}
+
+reply = (fd: i32, success: bool, text: str) () {
+    length ::= text.len;
+    (length > 4000).then(() {
+        length = 4000;
+        loop(length > 0 && text.ptr().read(length) >= 128 && text.ptr().read(length) < 192, (h) {
+            length = length - 1;
+        });
+    });
+    write_all(fd, success.match({ true => "T", false => "E" })).then(() {
+        write_all(fd, text.slice(0, length)).then(() { write_all(fd, "\0"); });
+    });
+}
+
+Worker = {
+    output: i32,
+    recognizer :: Res<Recognizer>,
+}
+
+Worker.impl(Actor, {
+    transcribe = (self :: @Self, ctx: Context, model: str, gpu: i32, pcm: str, rate: i32) {
+        scratch ::= ctx.env.mem.alloc();
+        self.recognizer.match({
+            None  => {
+                Recognizer.open(scratch, model, gpu).match({
+                    Ok(recognizer) => { self.recognizer = Ok(recognizer); },
+                    Err(error)     => error.match({
+                        NativeError(detail) => reply(
+                            self.output,
+                            false,
+                            detail.message.view()
+                        ),
+                        _                   => reply(
+                            self.output,
+                            false,
+                            "Cannot load Parakeet model."
+                        ),
+                    }),
+                });
+            },
+            Ok(_) => (),
+        });
+        self.recognizer.match({
+            None           => (),
+            Ok(recognizer) => {
+                // Actor message bytes are copied; copy again into f32-aligned
+                // storage instead of assuming the packed str payload alignment.
+                count = pcm.len / 4;
+                scratch.realloc<f32>(null_ptr<f32>(), count).match({
+                    Err(_)      => reply(
+                        self.output,
+                        false,
+                        "Cannot allocate audio buffer."
+                    ),
+                    Ok(samples) => {
+                        samples.to<u8>().copy_from(pcm.ptr(), count * 4);
+                        recognizer.transcribe(
+                            scratch,
+                            samples,
+                            count,
+                            rate
+                        ).match({
+                            Ok(text)   => reply(self.output, true, text.view()),
+                            Err(error) => error.match({
+                                NativeError(detail) => reply(
+                                    self.output,
+                                    false,
+                                    detail.message.view()
+                                ),
+                                _                   => reply(
+                                    self.output,
+                                    false,
+                                    "Parakeet transcription failed."
+                                ),
+                            }),
+                        });
+                    },
+                });
+            },
+        });
+    }
+
+    stopped = (self :: @Self, ctx: Context) {
+        self.recognizer.match({
+            Ok(recognizer) => { owner ::= recognizer; owner.close(); },
+            None           => (),
+        });
+        self.recognizer = None;
+    }
+})
+
+// Single owning handle. Keep a alive through close(), and do not copy a live
+// handle. close drains the worker: native inference does not support cancellation.
+Transcriber* = {
+    worker: Ref<Worker>,
+    input :: i32,
+    output :: i32,
+    descriptor: Ptr<PollFd>,
+    buffer: Ptr<u8>,
+    used :: usize,
+    busy* :: bool,
+
+    open* = (env: Env, a: Alloc) Res<Transcriber, MailboxError
+        | ActorStartError
+        | AllocError> {
+        descriptors = a.realloc<i32>(null_ptr<i32>(), 2).try();
+        @scope.defer(() { a.free(descriptors); });
+        buffer     = a.realloc<u8>(null_ptr<u8>(), 4096).try();
+        descriptor = a.create<PollFd>().try();
+        (Posix.pipe(descriptors) == 0).ensure(MailboxError.OpenFailed).try();
+        input  = descriptors.read(0);
+        output = descriptors.read(1);
+        descriptor.write(0, PollFd(fd: input, events: 1, returned: 0));
+        env.spawn(Worker(output: output, recognizer: None)).match({
+          Err(error) => { Posix.close(input); Posix.close(output); Err(error) },
+          Ok(worker) => Ok(Transcriber(
+              worker: worker,
+              input: input,
+              output: output,
+              descriptor: descriptor,
+              buffer: buffer,
+              used: 0,
+              busy: false
+          )),
+        })
+    }
+
+    // The first successful model/gpu configuration stays cached until close.
+    submit* = (self :: @Self, model: str, gpu: i32, samples: Ptr<f32>, count: usize, rate: i32)
+              Res<bool, ActorError> {
+        (self.busy || self.input < 0 || model.len == 0 || samples.is_null() || count == 0 || count > 5760000).match({
+            true  => Ok(false),
+            false => {
+                self.worker.transcribe(
+                    model,
+                    gpu,
+                    str_at(samples.to<u8>(), count * 4),
+                    rate
+                ).try();
+                self.used = 0;
+                self.busy = true;
+                Ok(true)
+            },
+        })
+    }
+
+    // Returned text borrows this handle's buffer until the next submit/poll.
+    poll* = (self :: @Self) Res<Res<Transcript>, MailboxError> {
+        (!self.busy).match({
+            true  => Ok(None),
+            false => self.read_reply(),
+        })
+    }
+
+    read_reply = (self :: @Self) Res<Res<Transcript>, MailboxError> {
+        ready = Polling.ready(self.descriptor, 1, 0);
+        (ready >= 0 || Errors.__error().read(0) == 4).ensure(MailboxError.ReadFailed).try();
+        (ready <= 0).match({
+            true  => Ok(None),
+            false => {
+                count = Posix.read(
+                    self.input,
+                    self.buffer.offset(self.used),
+                    4096 - self.used
+                );
+                (count > 0 && count <= 4096 - self.used).ensure(
+                    MailboxError.ReadFailed
+                ).try();
+                self.used = self.used + count;
+                (self.buffer.read(self.used - 1) == 0).match({
+                    false => {
+                        (self.used < 4096).ensure(
+                            MailboxError.ReadFailed
+                        ).try();
+                        Ok(None)
+                    },
+                    true  => {
+                        self.busy = false;
+                        Ok(Ok(Transcript(
+                            success: self.buffer.read(0) == 'T',
+                            text: str_at(self.buffer.offset(1), self.used - 2)
+                        )))
+                    },
+                })
+            },
+        })
+    }
+
+    close* = (self :: @Self) () {
+        (self.input >= 0).then(() {
+            self.worker.stop();
+            self.worker.join();
+            Posix.close(self.input);
+            Posix.close(self.output);
+            self.input  = -1;
+            self.output = -1;
+            self.busy   = false;
+        });
+    }
+}
