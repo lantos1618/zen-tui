@@ -4,7 +4,7 @@ Error = AllocError | ActorStartError | ActorError | MailboxError
 Ptr, null_ptr = std.mem
 analyze, bands, encode_wav = audio
 Audio, decode = parakeet.wav
-Math = c.bind("math.h", { log10* = (value: f64) f64 })
+log10 = std.math
 
 main = (env: Env) Res<i32, Error> {
     help = env.argv.find((arg) { arg.eq("--help") || arg.eq("-h") }).match({
@@ -97,7 +97,7 @@ run = (env: Env) Res<i32, Error> {
                 bands(magnitudes, 513, levels, 32);
                 Range(0, 32).loop((i) {
                     amplitude = levels.read(i);
-                    db        = (amplitude > 0.001).match({true => (20.0 * Math.log10(
+                    db        = (amplitude > 0.001).match({true => (20.0 * log10(
                         amplitude
                     ) + 60.0) / 60.0, false => 0.0});
                     levels.write(
