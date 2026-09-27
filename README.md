@@ -1,10 +1,10 @@
 # Zen Code
 
-The app formerly called Zen TUI. The checkout and GitHub repository remain
-`zen-tui` to preserve existing history and links. This milestone is a native
-voice-workspace foundation, not yet a code editor or terminal emulator.
+A native voice-workspace foundation. The checkout and GitHub repository are
+`zen-tui`; the application is Zen Code. Code editing and terminal emulation are
+not implemented.
 
-[Execution plan](docs/PLAN.md) · [Library architecture](docs/ARCHITECTURE.md) ·
+[Library architecture](docs/ARCHITECTURE.md) · [Thread ownership](docs/THREADING.md) ·
 [Benchmarks](docs/BENCHMARKS.md)
 
 A native macOS voice workspace written in Zen. F2 starts/stops microphone
@@ -124,8 +124,9 @@ ZEN_TRANSCRIBE_WAV=/absolute/path/mono-float32.wav \
 app/ZenCode.app/Contents/MacOS/ZenCode --voice-smoke
 ```
 
-It waits at most 1800 event-loop ticks for a nonempty transcript, reports the
-text/frame count, and exits. Shutdown still drains accepted inference. Run
+It polls for a nonempty transcript for at most 30 seconds and reports text,
+frame count, and submit-to-reply time. Shutdown still drains accepted inference,
+so an outstanding native call can delay process exit beyond that deadline. Run
 `python3 tests/transcription/run.py` for the real-library asynchronous failure
 and mailbox lifecycle checks (SDK must be installed). The same tests exercise
 live admission, deferred final requests, stale session rejection, 77.5 seconds
@@ -134,13 +135,9 @@ of continuous segment/tail accounting, and bounded cumulative display history. A
 --wav ../zen-parakeet/build/fixture.wav` to check a real partial and final against
 the known quick-brown-fox speech fixture.
 
-Validated locally: 60-frame render smoke, FFT/WAV numerical checks in zen-audio,
-a recognizable partial from a four-second fixture prefix, and the full result
-from its 8.49-second recording. The updated app also completed the known speech
-fixture through Metal while submitting 38 frames. Microphone start/activity/stop
-was verified previously; this update used fixtures without restarting the live
-user window. Fresh-install permission prompting and denied-to-authorized recovery
-were not UI-tested.
+See [performance measurements](docs/BENCHMARKS.md) for smoke results and
+remaining pacing limits. Fresh-install permission prompting and
+denied-to-authorized recovery have not been UI-tested.
 
 Metal clears/presents frames; Core Animation renders text and bars. FFT is
 scalar Zen with a Hann window. The voice display has 32 mel bands from 80 Hz to
@@ -150,29 +147,16 @@ is not yet a PTY terminal emulator, custom GPU glyph renderer, or SIMD library.
 
 ## Actor messages
 
-The app imports `Transcriber` and `Live` from `zen-voice`; its own `history.zen`
-owns rolling display text. The UI sends copied cumulative PCM and model
-configuration to the inference actor.
-The one in-flight request carries a capture session and partial/final identity
-on the main-thread handle; these remain attached until its reply is consumed. That
-actor sends a typed `deliver(success: bool, text: str)` message to the result
-actor; the runtime copies the text before inference scratch storage expires.
-The result actor bridges its messages to AppKit's main thread through the
-bounded pipe mailbox, polled with a zero timeout and partial-read framing. Neither actor touches window state. A rejected
-result-message admission reports an error through the bridge instead of leaving
-the UI waiting. Shutdown stops microphone capture, drains inference and result
-delivery, then closes
-the pipe. A general main-thread actor executor is not implemented yet.
+`zen-voice` owns inference and bounded copied replies. The app owns rolling
+history and rejects results from superseded capture sessions. UI and capture
+stay on the main thread; neither speech actor touches window state. See
+[thread ownership](docs/THREADING.md) for copying, mailbox, shutdown, and remaining
+main-thread costs, and [zen-voice](https://github.com/lantos1618/zen-voice) for the
+public pipeline API.
 
-Actors currently run on pthread workers. AppKit and all rendering stay on the
-main thread; the input stream, model handle, scratch arenas, and copied message
-bytes have separate owners. This bridge is not a lock-free main-thread actor
-executor.
+## Packaging
 
-## Development status
-
-Zen Code 0.2 uses the bundle identifier `dev.zen.code`. macOS may ask for
-microphone access for this new app identity; recording is still off at launch.
-The old Zen TUI bundle is not the new executable. Existing running sessions are
-not replaced when the build finishes. Build output is ignored; source, metadata,
-library APIs, and benchmark harnesses are tracked.
+Zen Code uses bundle identifier `dev.zen.code`. Build output, local model paths,
+and recordings are ignored. The development executable uses the SDK library
+path configured during the build; packaging native dependencies and producing a
+signed/notarized distributable are not implemented.

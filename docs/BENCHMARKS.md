@@ -69,49 +69,28 @@ submission intervals, unlike the batch-mean DSP percentiles above. They do not
 measure GPU execution or physical presentation, and initial samples include
 startup. `--smoke` now requires 60 submitted frames within 30 seconds.
 
-A local fixture run during integration transcribed “the quick brown fox jumps
-over the lazy dog” while submitting 36 frames. Submit-to-polled-reply was 632 ms,
-including model load, actor transport and UI polling. This is one smoke
-observation with warm system caches, not a latency distribution or microphone
-end-to-end benchmark. The final validation record should be used for any later
-measurements after code changes.
-
-Visual inspection of the rebuilt app showed both status rows without clipping.
-A visible idle snapshot reported 60.1 submission FPS, p95 16.91 ms and p99
-17.19 ms. A brief microphone/FFT check reported 60 FPS, p95 17.05 ms and p99
-17.84 ms, with received audio and error code zero; capture was then stopped.
-These snapshots are not a sustained-performance guarantee. Separate long SDK
-runs slowed markedly and missed their frame-count deadline, without inference
-running; the cause remains unclassified. See the SDK README for those results.
-A bounded Metal System Trace was saved locally under the SDK's ignored build
-folder; raw system traces are not published with source.
-
-Final rebuilt-app checks (exit zero, display link active in both):
+The rebuilt app passed both bounded smoke checks with the display link active:
 
 | Check | Submitted frames | Last FPS window | p95 / p99 interval | Submit-to-reply |
 | --- | ---: | ---: | ---: | ---: |
 | Render smoke | 60 | 58.1 | 16.77 / 33.41 ms | n/a |
 | First fixture transcription | 31 | 27.1 | 33.32 / 33.32 ms | 617 ms |
 
-The fixture text matched the known phrase. This short first-inference run
-includes startup and native GPU pipeline initialization; the lower submission
-rate is a remaining performance observation, not evidence that CPU actors are
-serializing inference onto the UI thread. Separate warm-inference and
-presentation traces are needed before assigning a cause or promising 60 FPS
-under transcription load.
+The fixture matched “the quick brown fox jumps over the lazy dog.” Submit-to-reply
+includes model loading, actor transport and UI polling, but excludes microphone
+capture. This single short run includes startup and native GPU pipeline
+initialization; it is not a latency distribution or sustained performance test.
+The lower submission rate remains unexplained by these measurements.
 
-### Trace correlation
+Visible desktop snapshots reported 60.1 submission FPS at idle (p95 16.91 ms,
+p99 17.19 ms) and 60 FPS during a brief microphone/FFT check (p95 17.05 ms,
+p99 17.84 ms, received audio, error zero). Both status rows were visible without
+clipping. These snapshots do not establish sustained 60 FPS during transcription.
 
-The bounded SDK Metal trace records the test process as foreground from
-1.269–2.839 seconds, then background through the end at 11.089 seconds.
-Submissions fall from 42 in the partial first second and 50 in the transition
-second to roughly three per second afterward. Its GPU clear intervals were
-about 19.4 µs median, 22.1 µs p95 and 23.9 µs maximum; CPU-to-GPU latency was
-about 0.589 ms median, 0.966 ms p95 and 1.933 ms maximum. No drawable-buffer-wait
-rows were recorded.
-
-This correlates the traced slowdown with background state and rules against
-heavy GPU clear work in that trace. It does not establish the cause of every
-prior long-test failure, measure Core Animation text/compositor cost, or explain
-the separate first-inference dip. The trace ended at the recording time limit;
-xctrace reported a backdated-signpost warning and saved a readable trace.
+Longer SDK-only tests also missed frame-count deadlines without inference. A
+bounded Metal trace associated its slowdown with background state while GPU
+clear work remained around 20 µs. See the SDK's
+[desktop validation](https://github.com/lantos1618/zen-macos/blob/main/docs/PERFORMANCE.md)
+for the failed runs, trace measurements, and limitations. Warm-inference and
+presentation traces are still needed to diagnose the separate first-inference
+dip. Neither the current overlay nor these checks measure physical presentation.

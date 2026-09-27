@@ -19,7 +19,7 @@ flowchart TD
 
 | Owner | Responsibility | Excluded concerns |
 |---|---|---|
-| zen-macos | Native window/input, Metal presentation, AudioQueue capture, permission display, monotonic time, bundle resources | Speech inference and DSP |
+| zen-macos | Native window/input, Metal presentation, AudioQueue capture, permission display, display scheduling, bundle resources | Speech inference and DSP |
 | zen-audio | FFT, speech-frequency display mapping, smoothing, WAV encoding | Devices, windows, actors, models |
 | zen-parakeet | Direct native ABI, model/result lifetime, synchronous recognition | UI and microphone policy |
 | zen-voice | Copied actor messages, asynchronous recognition, bounded mailbox and live-segment scheduling | Window state, audio device handles, display history |
@@ -48,3 +48,17 @@ zen-macos still has a convenience App UI; extracting a general UI toolkit before
 there is an editor/document model would make an untested abstraction. Full code
 editing, undo, projects, PTY integration, and durable transcription are subsequent
 milestones, not features claimed by this refactor.
+
+## Remaining work
+
+- File/project model, editing, undo/redo, save and conflict handling.
+- Native dependency packaging and signed/notarized distributable builds.
+- Capture-to-visible-text latency instrumentation, frame-time graph, and optional
+  telemetry export; current timing covers submission intervals only.
+- Segment overlap and a backend with native cached streaming support.
+- A generic pollable std actor channel. SIMD and compiler optimization work
+  should follow measured bottlenecks; typed native handles need a settled design.
+
+Extract a separate UI toolkit when another application establishes reusable
+requirements. See [threading](THREADING.md) for current ownership and
+[benchmarks](BENCHMARKS.md) for measured limits.
