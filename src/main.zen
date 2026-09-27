@@ -1,5 +1,7 @@
 App, Config = macos
-Transcriber, Transcript, MailboxError, Live, History, quiet_tail = transcription
+Transcriber, Transcript, MailboxError, Live, quiet_tail = voice
+History, recent_text = history
+load_model, configure_model = config
 CAPTURE_OVERFLOW = macos.audio
 Error = AllocError | ActorStartError | ActorError | MailboxError
 Ptr, null_ptr = std.mem
@@ -14,13 +16,43 @@ main = (env: Env) Res<i32, Error> {
     });
     help.match({
         true  => {
-            println("Zen TUI — a native workspace powered by zen-macos");
-            println("Usage: ZenTUI [--smoke] [--help]");
+            println("Zen Code — a native workspace powered by zen-macos");
+            println("Usage: ZenCode [--smoke] [--check-config] [--help]");
             println("F2 records your voice. Enter speaks text. Escape closes.");
             println("--smoke renders a bounded number of frames and exits.");
+            println(
+                "--set-model /absolute/model.gguf saves the local model path for normal launches."
+            );
             Ok(0)
         },
-        false => run(env),
+        false => env.argv.find((arg) { arg.eq("--check-config") }).match({
+            Ok(_) => {
+                a          = env.mem.alloc();
+                configured = load_model(env, a).try().match({
+                    Ok(path) => env.fs.exists(path) && !env.fs.is_dir(path),
+                    None     => false,
+                });
+                println(
+                    "Zen Code 0.2 · local model available: {}",
+                    configured
+                );
+                Ok(configured.match({true => 0, false => 1}))
+            },
+            None  => env.argv.get(1).match({
+                Ok(arg) => arg.eq("--set-model").match({
+                    true  => {
+                        a          = env.mem.alloc();
+                        path       = env.argv.get(
+                            2
+                        ).match({Ok(value) => value, None => ""});
+                        configured = configure_model(env, a, path).try();
+                        Ok(configured.match({true => 0, false => 1}))
+                    },
+                    false => run(env),
+                }),
+                None    => run(env),
+            }),
+        }),
     })
 }
 
@@ -29,11 +61,11 @@ run = (env: Env) Res<i32, Error> {
     app   ::= App.configured(
         arena,
         Config(
-            title: "Zen TUI",
-            heading: "ZEN TUI",
+            title: "Zen Code",
+            heading: "ZEN CODE",
             description: "LOCAL VOICE / METAL\n\nF2 starts/stops microphone capture.\nEnter speaks typed text · Escape closes.",
             prompt: "you › ",
-            greeting: "Welcome to Zen TUI.",
+            greeting: "Welcome to Zen Code.",
             spectrum_label: "Voice FFT 80 Hz–4 kHz",
             input_tail_bytes: 600
         )
@@ -43,7 +75,7 @@ run = (env: Env) Res<i32, Error> {
     @scope.defer(() { transcriber.close(); });
     // Stop capture before waiting for any noncancellable inference on exit.
     @scope.defer(() { app.microphone.stop(); });
-    model = env.var("ZEN_PARAKEET_MODEL");
+    model = load_model(env, arena).try();
     app.microphone.continuous(
         model.match({Ok(path) => path.len > 0, None => false})
     );
@@ -247,7 +279,7 @@ run = (env: Env) Res<i32, Error> {
                 });
                 ticks = ticks + 1;
             });
-            println("zen-tui: {} Metal frames", app.frames);
+            println("zen-code: {} Metal frames", app.frames);
             Ok(
                 (app.frames > 0 && (!voice_smoke || voice_ready)).match({true => 0, false => 1})
             )

@@ -1,0 +1,59 @@
+Ptr, null_ptr = std.mem
+str_at = std.text
+
+// Bounded main-thread display history, not a durable transcript. The buffer
+// never grows; scratch combinations are released at the end of a UI tick.
+History* = {
+    bytes: Ptr<u8>,
+    used :: usize,
+    trimmed :: bool,
+
+    open* = (a: Alloc) Res<History, AllocError> {
+        Ok(History(
+            bytes: a.realloc<u8>(null_ptr<u8>(), 3500).try(),
+            used: 0,
+            trimmed: false
+        ))
+    }
+    reset* = (self :: @Self) () { self.used = 0; self.trimmed = false; }
+    view* = (self: @Self) str { str_at(self.bytes, self.used) }
+
+    commit* = (self :: @Self, a: Alloc, text: str) Res<(), AllocError> {
+        combined     = a.String(
+            "{}{}{}",
+            self.view(),
+            (self.used > 0 && text.len > 0).match({true => " ", false => ""}),
+            text
+        ).try();
+        tail         = recent_text(combined.view(), 3500);
+        self.trimmed = self.trimmed || tail.len < combined.len();
+        self.bytes.copy_from(tail.ptr(), tail.len);
+        self.used = tail.len;
+        Ok(())
+    }
+
+    render* = (self: @Self, a: Alloc, partial: str) Res<String, AllocError> {
+        combined = a.String(
+            "{}{}{}",
+            self.view(),
+            (self.used > 0 && partial.len > 0).match({true => " ",false => ""}),
+            partial
+        ).try();
+        tail     = recent_text(combined.view(), 3500);
+        result ::= a.String().try();
+        (self.trimmed || tail.len < combined.len()).then(() {
+            result.add("[Earlier text omitted]\n").try();
+        });
+        result.add(tail).try();
+        Ok(result)
+    }
+}
+
+recent_text* = (text: str, limit: usize) str {
+    start ::= (text.len > limit).match({true => text.len - limit,false => 0});
+    loop(
+        start < text.len && text.ptr().read(start) >= 128 && text.ptr().read(start) < 192,
+        (h) { start = start + 1; }
+    );
+    text.slice(start, text.len)
+}

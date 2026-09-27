@@ -1,4 +1,5 @@
-Live, History, quiet_tail = transcription
+Live, quiet_tail = voice
+History, recent_text = history
 
 main = (env: Env) Res<i32, AllocError> {
     a = env.mem.alloc();

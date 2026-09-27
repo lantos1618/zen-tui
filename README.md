@@ -1,4 +1,11 @@
-# Zen TUI
+# Zen Code
+
+The app formerly called Zen TUI. The checkout and GitHub repository remain
+`zen-tui` to preserve existing history and links. This milestone is a native
+voice-workspace foundation, not yet a code editor or terminal emulator.
+
+[Execution plan](docs/PLAN.md) · [Library architecture](docs/ARCHITECTURE.md) ·
+[Benchmarks](docs/BENCHMARKS.md)
 
 A native macOS voice workspace written in Zen. F2 starts/stops microphone
 capture; the app displays a live FFT and measured Metal submission FPS. With a
@@ -14,6 +21,8 @@ Keep sibling checkouts under one directory:
 - [zen-macos](https://github.com/lantos1618/zen-macos): window, native input,
   microphone device, Metal presentation, and speech synthesis.
 - [zen-audio](https://github.com/lantos1618/zen-audio): FFT, bands, and WAV encoding.
+- [zen-voice](https://github.com/lantos1618/zen-voice): actor-based transcription,
+  bounded messages, and continuous dictation scheduling.
 - [zen-parakeet](https://github.com/lantos1618/zen-parakeet): direct native NeMo
   Speech C bindings and resource ownership for Parakeet v3.
 
@@ -33,16 +42,27 @@ From this repository:
 
 ```sh
 ZEN_STD=../zen/src \
-CFLAGS="-I$PWD/../zen-parakeet/build/nemo-speech/include -Wl,-rpath,$PWD/../zen-parakeet/build/nemo-speech/lib" \
+CFLAGS="-O2 -I$PWD/../zen-parakeet/build/nemo-speech/include -Wl,-rpath,$PWD/../zen-parakeet/build/nemo-speech/lib" \
 ../zen/zen build .
 
-ZEN_PARAKEET_MODEL="$PWD/../zen-parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf" \
-app/ZenTUI.app/Contents/MacOS/ZenTUI
+app/ZenCode.app/Contents/MacOS/ZenCode --set-model \
+  "$PWD/../zen-parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf"
+app/ZenCode.app/Contents/MacOS/ZenCode --check-config
+open app/ZenCode.app
 ```
 
 The SDK paths are explicit build inputs. The current project builder does not
-fetch dependencies or infer include paths. Without `ZEN_PARAKEET_MODEL`, the
-window, spectrum, microphone, and speech synthesis work; transcription stays off.
+fetch dependencies or infer include paths. Configure the local model once with
+`--set-model /absolute/model.gguf`; the development bundle stores only its path
+in ignored `Contents/Resources/model-path.txt`. Normal Finder launches then work
+without shell configuration. `ZEN_PARAKEET_MODEL` overrides that saved path;
+an empty override intentionally disables transcription. `--check-config` verifies
+that the selected file exists without opening a window or loading the model.
+Invalid configuration commands leave the previous selection intact. No weights
+are copied or downloaded. Moving the model requires configuring its new path.
+This is development-bundle configuration, not signed-app deployment packaging.
+Without either setting, the window, spectrum, microphone, and speech synthesis
+work; transcription stays off.
 The model is loaded lazily on the first submitted recording and retained by the
 worker. Inference uses the native Metal backend (GPU index 0).
 
@@ -101,7 +121,7 @@ microphone or loading the model. The complete fixture test also avoids the mic:
 ```sh
 ZEN_PARAKEET_MODEL=/absolute/path/model.gguf \
 ZEN_TRANSCRIBE_WAV=/absolute/path/mono-float32.wav \
-app/ZenTUI.app/Contents/MacOS/ZenTUI --voice-smoke
+app/ZenCode.app/Contents/MacOS/ZenCode --voice-smoke
 ```
 
 It waits at most 1800 event-loop ticks for a nonempty transcript, reports the
@@ -130,7 +150,9 @@ is not yet a PTY terminal emulator, custom GPU glyph renderer, or SIMD library.
 
 ## Actor messages
 
-The UI sends copied cumulative PCM and model configuration to the inference actor.
+The app imports `Transcriber` and `Live` from `zen-voice`; its own `history.zen`
+owns rolling display text. The UI sends copied cumulative PCM and model
+configuration to the inference actor.
 The one in-flight request carries a capture session and partial/final identity
 on the main-thread handle; these remain attached until its reply is consumed. That
 actor sends a typed `deliver(success: bool, text: str)` message to the result
@@ -146,3 +168,11 @@ Actors currently run on pthread workers. AppKit and all rendering stay on the
 main thread; the input stream, model handle, scratch arenas, and copied message
 bytes have separate owners. This bridge is not a lock-free main-thread actor
 executor.
+
+## Development status
+
+Zen Code 0.2 uses the bundle identifier `dev.zen.code`. macOS may ask for
+microphone access for this new app identity; recording is still off at launch.
+The old Zen TUI bundle is not the new executable. Existing running sessions are
+not replaced when the build finishes. Build output is ignored; source, metadata,
+library APIs, and benchmark harnesses are tracked.

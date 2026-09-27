@@ -15,15 +15,19 @@ build = (b :: Builder) Res<(), BuildError> {
         libs: ["nemo_speech_asr_c"],
         paths: ["../zen-parakeet/build/nemo-speech/lib"],
     }).try();
-    b.exe("zen-tui", {
+    voice    = b.lib(
+        "voice",
+        {src: Path("../zen-voice/src/voice.zen"), libs: [], paths: []}
+    ).try();
+    b.exe("zen-code", {
         src: Path("src/main.zen"),
-        deps: [macos, audio, parakeet],
+        deps: [macos, audio, parakeet, voice],
         language: "objective-c",
         frameworks: [
             "AppKit", "Foundation", "QuartzCore", "Metal", "AVFoundation",
             "AudioToolbox", "CoreFoundation"
         ],
-        out: Ok(Path("app/ZenTUI.app/Contents/MacOS/ZenTUI")),
+        out: Ok(Path("app/ZenCode.app/Contents/MacOS/ZenCode")),
     }).try();
     Ok(())
 }

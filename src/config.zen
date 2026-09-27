@@ -1,0 +1,36 @@
+resource_directory = macos.bundle
+
+// Model configuration is local to this installation, never downloaded at launch.
+// Return views owned by the caller's app-lifetime allocator or by Env.
+load_model* = (env: Env, a: Alloc) Res<Res<str>, AllocError> {
+    override = env.var("ZEN_PARAKEET_MODEL");
+    override.match({
+        Ok(path) => Ok(path.trim()),
+        None     => resource_directory(a).try().match({
+            None          => Ok(None),
+            Ok(directory) => {
+                path = a.String("{}/model-path.txt", directory.view()).try();
+                env.fs.read(a, path.view()).match({
+                    Ok(value) => Ok(value.view().trim()),
+                    Err(_)    => Ok(None),
+                })
+            },
+        }),
+    })
+}
+
+configure_model* = (env: Env, a: Alloc, model: str) Res<bool, AllocError> {
+    (model.starts_with("/") && env.fs.exists(model) && !env.fs.is_dir(model)).match({
+        false => { println("Use an absolute path to an existing local model."); Ok(false) },
+        true  => resource_directory(a).try().match({
+            None          => { println("Run configuration from the Zen Code app bundle."); Ok(false) },
+            Ok(directory) => {
+                target = a.String("{}/model-path.txt", directory.view()).try();
+                env.fs.write(target.view(), model).match({
+                    Ok(_)  => { println("Zen Code local model configured."); Ok(true) },
+                    Err(_) => { println("Cannot write model configuration in this development bundle."); Ok(false) },
+                })
+            },
+        }),
+    })
+}

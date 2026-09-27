@@ -1,3 +1,5 @@
 build/
 app/ZenTUI.app/Contents/MacOS/
 .DS_Store
+app/ZenCode.app/Contents/MacOS/
+app/ZenCode.app/Contents/Resources/model-path.txt
