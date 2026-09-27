@@ -99,3 +99,19 @@ rate is a remaining performance observation, not evidence that CPU actors are
 serializing inference onto the UI thread. Separate warm-inference and
 presentation traces are needed before assigning a cause or promising 60 FPS
 under transcription load.
+
+### Trace correlation
+
+The bounded SDK Metal trace records the test process as foreground from
+1.269–2.839 seconds, then background through the end at 11.089 seconds.
+Submissions fall from 42 in the partial first second and 50 in the transition
+second to roughly three per second afterward. Its GPU clear intervals were
+about 19.4 µs median, 22.1 µs p95 and 23.9 µs maximum; CPU-to-GPU latency was
+about 0.589 ms median, 0.966 ms p95 and 1.933 ms maximum. No drawable-buffer-wait
+rows were recorded.
+
+This correlates the traced slowdown with background state and rules against
+heavy GPU clear work in that trace. It does not establish the cause of every
+prior long-test failure, measure Core Animation text/compositor cost, or explain
+the separate first-inference dip. The trace ended at the recording time limit;
+xctrace reported a backdated-signpost warning and saved a readable trace.
