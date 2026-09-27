@@ -3,3 +3,10 @@ app/ZenTUI.app/Contents/MacOS/
 .DS_Store
 app/ZenCode.app/Contents/MacOS/
 app/ZenCode.app/Contents/Resources/model-path.txt
+**/build/
+**/xcuserdata/
+**/com.apple.DeveloperTools/
+*.mobileprovision
+*.p12
+*.p8
+*.xcarchive/
