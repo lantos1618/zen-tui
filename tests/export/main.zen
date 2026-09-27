@@ -1,0 +1,45 @@
+Exporter, MAX_EXPORT_SAMPLES = export
+Ptr, null_ptr = std.mem
+
+main = (env: Env) Res<i32, AllocError | ActorStartError | ActorError> {
+    a ::= env.mem.alloc();
+    path    = env.var("ZEN_EXPORT_TEST_FILE").value_or("");
+    samples = a.realloc<f32>(null_ptr<f32>(), 4).try();
+    Range(0, 4).loop((i) { samples.write(i, 1.0); });
+    exporter ::= Exporter.open(env, path, a).try();
+    good     ::= exporter.enqueue(
+        null_ptr<f32>(),
+        MAX_EXPORT_SAMPLES + 1,
+        16000
+    ).match({
+        Err(Full) => true, _ => false
+    });
+    exporter.enqueue(samples, 4, 16000).try();
+    // Accepted messages own their PCM snapshot, not the caller's later bytes.
+    Range(0, 4).loop((i) { samples.write(i, 0.0); });
+    exporter.close();
+    good = good && exporter.enqueue(samples, 4, 16000).match({
+        Err(Closed) => true, _ => false
+    });
+    exporter.close();
+    good = good && env.fs.read(a, path).match({
+        Err(_)  => false,
+        Ok(wav) => wav.len() == 74 && wav.view().starts_with("RIFF")
+            && wav.view().ptr().read(60) == 128 && wav.view().ptr().read(61) == 63
+    });
+    // A second worker publishes a new complete file over the existing export.
+    second ::= Exporter.open(env, path, a).try();
+    Range(0, 4).loop((i) { samples.write(i, 2.0); });
+    second.enqueue(samples, 4, 16000).try();
+    second.close();
+    good = good && env.fs.read(a, path).match({
+        Err(_)  => false,
+        Ok(wav) => wav.len() == 74 && wav.view().ptr().read(60) == 0
+            && wav.view().ptr().read(61) == 64
+    });
+    println(
+        "Export snapshot, bounded admission, drain, atomic replacement: {}",
+        good
+    );
+    Ok(good.match({true => 0, false => 1}))
+}

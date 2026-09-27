@@ -94,3 +94,22 @@ clear work remained around 20 µs. See the SDK's
 for the failed runs, trace measurements, and limitations. Warm-inference and
 presentation traces are still needed to diagnose the separate first-inference
 dip. Neither the current overlay nor these checks measure physical presentation.
+
+## Prepared-model integration check
+
+On the same Apple M2 Pro, the integrated preparation path returned the fixture
+text “the quick brown fox jumps over the lazy dog” in 82 ms from warm admission
+to UI reply. Model preparation and capture are excluded from that timing.
+Preparation currently primes one second of silence; other input shapes can
+still require additional GPU compilation.
+
+The render-only check submitted 60 frames at 60 FPS (p95 16.92 ms, p99 20.36 ms).
+The short preparation-plus-fixture run submitted 41 frames with a final 54.2 FPS
+window (p95 33.21 ms, p99 44.7 ms). These are single smoke runs, not sustained
+latency distributions, and do not establish smooth presentation under inference.
+An earlier fixture invocation ended without a transcript or completion summary;
+its zero exit status was not accepted as successful validation.
+
+The one-hour scheduling test uses simulated sample counts. Real-model CPU tests
+cover preparation, partial/final replies and a second segment; they do not
+establish hour-long microphone accuracy or stability.

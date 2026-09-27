@@ -1,0 +1,183 @@
+Document, DocumentError = document
+
+FailAfter = {
+    base: Alloc,
+    left: Ptr<usize>,
+
+    take = (self: @Self) bool {
+        n = self.left.read(0);
+        (n == 0).match({
+            true  => false,
+            false => {
+                self.left.write(0, n - 1);
+                true
+            },
+        })
+    }
+}
+
+FailAfter.impl(Alloc, {
+    raw = (self: @Self, size: usize, align: usize)
+          Res<Ptr<u8>, AllocError> {
+        self.take().match({
+            true  => self.base.raw(size, align),
+            false => Err(AllocError.OutOfMemory),
+        })
+    }
+
+    realloc = <T>(self: @Self, p: Ptr<T>, count: usize)
+                Res<Ptr<T>, AllocError> {
+        self.take().match({
+            true  => self.base.realloc(p, count),
+            false => Err(AllocError.OutOfMemory),
+        })
+    }
+})
+
+main = (env: Env) Res<i32, AllocError> {
+    a = env.mem.alloc();
+    Range(0, 6).loop((budget) {
+        owner = env.mem.alloc();
+        left ::= owner.Vec<usize>();
+        left.add(budget).try();
+        failing = FailAfter(base: owner, left: left.ptr());
+        Document.create(failing, 64).match({
+            Ok(_)  => { (budget != 5).then(
+                () { Err(AllocError.OutOfMemory).try(); }
+            ); },
+            Err(_) => { (budget == 5).then(
+                () { Err(AllocError.OutOfMemory).try(); }
+            ); },
+        });
+    });
+    doc  ::= Document.create(a, 64).try();
+    good ::= doc.view().len == 0 && doc.cursor() == 0 && !doc.dirty() && !doc.undo() && !doc.backspace();
+    doc.insert("a界🙂z").match({Ok(_) => (), Err(_) => { good = false; }});
+    good = good && doc.cursor() == 9;
+    doc.left(); doc.left();
+    good = good && doc.cursor() == 4;
+    doc.insert("!").match({Ok(_) => (), Err(_) => { good = false; }});
+    good = good && doc.view().eq("a界!🙂z") && doc.cursor() == 5;
+    good = good && doc.undo() && doc.view().eq(
+        "a界🙂z"
+    ) && doc.cursor() == 4 && !doc.undo();
+    good = good && doc.backspace() && doc.view().eq(
+        "a🙂z"
+    ) && doc.cursor() == 1;
+    good = good && doc.undo() && doc.view().eq("a界🙂z");
+    doc.right();
+    good = good && doc.cursor() == 8;
+    doc.home(); good = good && doc.cursor() == 0;
+    doc.end(); good = good && doc.cursor() == 9;
+    doc.insert("\nsecond").match({Ok(_) => (), Err(_) => { good = false; }});
+    doc.home(); good = good && doc.cursor() == 10;
+    doc.left(); good = good && doc.cursor() == 9;
+    doc.home(); good = good && doc.cursor() == 0;
+    borrowed = doc.view().slice(1, 4);
+    doc.insert(borrowed).match({Ok(_) => (), Err(_) => { good = false; }});
+    good = good && doc.view().eq("界a界🙂z\nsecond");
+    vertical ::= Document.create(a, 64).try();
+    vertical.insert(
+        "a界z\nx\n🙂yz"
+    ).match({Ok(_) => (), Err(_) => { good = false; }});
+    vertical.home(); vertical.right(); vertical.right();
+    good = good && vertical.cursor() == 13;
+    vertical.up(); good = good && vertical.cursor() == 7;
+    vertical.up(); good = good && vertical.cursor() == 1;
+    vertical.up(); good = good && vertical.cursor() == 1;
+    vertical.down(); good = good && vertical.cursor() == 7;
+    vertical.down(); good = good && vertical.cursor() == 12;
+    vertical.down(); good = good && vertical.cursor() == 12;
+    small ::= Document.create(a, 4).try();
+    small.insert("界").match({Ok(_) => (), Err(_) => { good = false; }});
+    small.insert(
+        "xy"
+    ).match({Err(DocumentError.Capacity) => (), _ => { good = false; }});
+    invalid = "界".slice(0, 1);
+    small.insert(
+        invalid
+    ).match({Err(DocumentError.InvalidUtf8) => (), _ => { good = false; }});
+    good = good && small.view().eq(
+        "界"
+    ) && small.undo() && small.view().len == 0;
+    doc.save(
+        env,
+        a
+    ).match({Err(DocumentError.NoPath) => (), _ => { good = false; }});
+    file = env.var(
+        "ZEN_DOCUMENT_TEST_FILE"
+    ).match({Ok(path) => path, None => ""});
+    (file.len == 0).match({true => { good = false; }, false => {
+        env.fs.write(
+            file,
+            "original界"
+        ).match({Ok(_) => (), Err(_) => { good = false; }});
+        doc.load(
+            env,
+            a,
+            file
+        ).match({Ok(_) => (), Err(_) => { good = false; }});
+        good = good && doc.view().eq(
+            "original界"
+        ) && doc.cursor() == 0 && !doc.dirty();
+        doc.end();
+        doc.insert(
+            " changed"
+        ).match({Ok(_) => (), Err(_) => { good = false; }});
+        doc.save(env, a).match({Ok(_) => (), Err(_) => { good = false; }});
+        good = good && !doc.dirty();
+        read = env.fs.read(
+            a,
+            file
+        ).match({Ok(value) => value.view(), Err(_) => ""});
+        good = good && read.eq("original界 changed");
+        good = good && doc.undo() && doc.view().eq(
+            "original界"
+        ) && doc.dirty();
+        doc.load(
+            env,
+            a,
+            file
+        ).match({Ok(_) => (), Err(_) => { good = false; }});
+        doc.end();
+
+        doc.insert(" more").match({Ok(_) => (), Err(_) => { good = false; }});
+        env.fs.write(
+            file,
+            "external edit"
+        ).match({Ok(_) => (), Err(_) => { good = false; }});
+        doc.save(
+            env,
+            a
+        ).match({Err(DocumentError.Conflict) => (), _ => { good = false; }});
+        external = env.fs.read(
+            a,
+            file
+        ).match({Ok(value) => value.view(), Err(_) => ""});
+        good     = good && external.eq("external edit") && doc.dirty();
+        small.load(
+            env,
+            a,
+            file
+        ).match({Err(DocumentError.Capacity) => (), _ => { good = false; }});
+        good = good && small.view().len == 0;
+        env.fs.write(
+            file,
+            invalid
+        ).match({Ok(_) => (), Err(_) => { good = false; }});
+        doc.load(
+            env,
+            a,
+            file
+        ).match({Err(DocumentError.InvalidUtf8) => (), _ => { good = false; }});
+        good = good && doc.view().eq("original界 changed more");
+        env.fs.remove(file).match({Ok(_) => (), Err(_) => { good = false; }});
+        doc.save(
+            env,
+            a
+        ).match({Err(DocumentError.Io) => (), _ => { good = false; }});
+        good = good && !env.fs.exists(file);
+    }});
+    println("document Unicode edit/undo/capacity/load/save/conflict: {}", good);
+    Ok(good.match({true => 0, false => 1}))
+}

@@ -1,8 +1,8 @@
 # Zen Code
 
-A native voice-workspace foundation. The checkout and GitHub repository are
-`zen-tui`; the application is Zen Code. Code editing and terminal emulation are
-not implemented.
+A native voice workspace with a small single-document editor. The checkout and
+GitHub repository are `zen-tui`; the application is Zen Code. Terminal emulation
+is not implemented.
 
 [Library architecture](docs/ARCHITECTURE.md) · [Thread ownership](docs/THREADING.md) ·
 [Benchmarks](docs/BENCHMARKS.md)
@@ -10,8 +10,8 @@ not implemented.
 A native macOS voice workspace written in Zen. F2 starts/stops microphone
 capture; the app displays a live FFT and measured Metal submission FPS. With a
 configured local Parakeet model, a Zen actor revises the input text while you
-record and finishes the latest recording after you stop. Enter speaks that text.
-Escape exits.
+record and finishes the latest recording after you stop. In voice-workspace mode,
+Enter speaks that text and Escape exits. Document mode has separate editing controls.
 
 ## Libraries
 
@@ -53,18 +53,22 @@ open app/ZenCode.app
 
 The SDK paths are explicit build inputs. The current project builder does not
 fetch dependencies or infer include paths. Configure the local model once with
-`--set-model /absolute/model.gguf`; the development bundle stores only its path
-in ignored `Contents/Resources/model-path.txt`. Normal Finder launches then work
+`--set-model /absolute/model.gguf`; the app stores only its path
+in `~/Library/Application Support/dev.zen.code/model-path.txt`. Normal Finder launches then work
 without shell configuration. `ZEN_PARAKEET_MODEL` overrides that saved path;
 an empty override intentionally disables transcription. `--check-config` verifies
 that the selected file exists without opening a window or loading the model.
 Invalid configuration commands leave the previous selection intact. No weights
 are copied or downloaded. Moving the model requires configuring its new path.
-This is development-bundle configuration, not signed-app deployment packaging.
+Configuration does not modify the signed bundle. Existing development bundles
+still read their legacy `Contents/Resources/model-path.txt` when no user setting
+exists; `--set-model` writes the new user setting.
 Without either setting, the window, spectrum, microphone, and speech synthesis
 work; transcription stays off.
-The model is loaded lazily on the first submitted recording and retained by the
-worker. Inference uses the native Metal backend (GPU index 0).
+With a model configured, startup loads it and decodes one second of synthetic
+silence on the inference actor. F2 capture is enabled after the ready reply;
+warm-up never uses the microphone. The worker retains the model, using the native
+Metal backend (GPU index 0). Preparation can still contend with rendering.
 
 ## Voice and permissions
 
@@ -99,7 +103,7 @@ final request for any tail, even when an earlier partial or segment is busy.
 Starting a new capture supersedes the previous session; late replies cannot
 modify its text or discard its audio.
 
-Stable text is bounded to the most recent 3500 UTF-8 bytes, with an explicit
+In voice-workspace mode, stable text is bounded to the most recent 3500 UTF-8 bytes, with an explicit
 `[Earlier text omitted]` marker after trimming. The window shows approximately
 the latest 600 bytes so new words stay visible; speech uses the retained full
 input buffer. This is a rolling display, not a durable unlimited transcript.
@@ -111,7 +115,40 @@ mono float32 WAV, set `ZEN_RECORDING_PATH` to an explicit writable path. During
 continuous dictation each successfully completed segment replaces that file;
 it does not contain the entire session. With transcription disabled, stopping
 the bounded recording saves the whole retained recording. No audio file is
-created by default.
+created by default. Encoding and atomic file publication run in a separate export
+actor. Admission copies the PCM before the capture buffer is reused; each request
+is capped at 480,000 samples and the runtime mailbox holds at most 64 pending
+messages (up to 122.9 MB of queued PCM in the worst case, plus working buffers).
+Accepted exports drain on shutdown, so slow storage can delay exit. Queue
+admission failures are reported by the app; encoding and filesystem failures are
+logged to the console. This optional export is not a durable full-session archive.
+
+## Editing a document
+
+Launch an existing UTF-8 file explicitly:
+
+```sh
+app/ZenCode.app/Contents/MacOS/ZenCode --file /absolute/path/example.zen
+```
+
+Arrow keys move the cursor; typing, Tab, Enter and Backspace edit the document.
+Cmd-Z undoes one edit, and Cmd-S saves. F2 dictation previews partial text at the
+cursor and inserts each finalized phrase as one undoable edit. The document is
+limited to 64 KiB of UTF-8; cursor movement follows Unicode scalar boundaries,
+not grapheme clusters. The view shows a bounded region around the cursor.
+
+An ordinary close request with unsaved changes keeps the window open. Save first,
+or use Cmd-Shift-Q to discard and close. There is no autosave or crash recovery.
+Saving compares the file against its loaded/saved baseline and refuses detected
+external changes before atomic replacement. A concurrent writer can still race
+between that check and publication. Save failure retains the in-memory edits;
+saving is currently synchronous on the main thread.
+
+This is a minimal editor: no selection, clipboard/IME integration, redo,
+multi-document UI or project browser. Run `python3 tests/document/run.py` for
+UTF-8 edits, bounds, undo and file-conflict checks, and
+`python3 tests/export/run.py` for copied PCM, bounded admission, drain and atomic
+recording export.
 
 ## Checks
 
@@ -124,8 +161,10 @@ ZEN_TRANSCRIBE_WAV=/absolute/path/mono-float32.wav \
 app/ZenCode.app/Contents/MacOS/ZenCode --voice-smoke
 ```
 
-It polls for a nonempty transcript for at most 30 seconds and reports text,
-frame count, and submit-to-reply time. Shutdown still drains accepted inference,
+It prepares the model before submitting the fixture. The overall polling limit
+is 30 seconds, including preparation. It reports text, frame count, and warm
+submit-to-reply time; the reported interval excludes preparation and capture.
+Shutdown still drains accepted inference,
 so an outstanding native call can delay process exit beyond that deadline. Run
 `python3 tests/transcription/run.py` for the real-library asynchronous failure
 and mailbox lifecycle checks (SDK must be installed). The same tests exercise
@@ -156,7 +195,39 @@ public pipeline API.
 
 ## Packaging
 
-Zen Code uses bundle identifier `dev.zen.code`. Build output, local model paths,
-and recordings are ignored. The development executable uses the SDK library
-path configured during the build; packaging native dependencies and producing a
-signed/notarized distributable are not implemented.
+Zen Code uses bundle identifier `dev.zen.code`. The Zen packaging target copies
+an existing build into a separate bundle and discovers its transitive native
+libraries using Apple's `otool`. It copies the needed SDK dylibs, rewrites their
+load paths to bundle-relative locations, removes build rpaths, includes the
+SDK's license notices, and applies an ad-hoc development signature. The input
+bundle and SDK remain untouched. No compiler or SDK checkout is needed to run
+the resulting bundle; a separately installed model is still required for voice
+transcription.
+
+```sh
+ZEN_STD=../zen/src ../zen/zen build zen-package
+build/zen-package app/ZenCode.app ../zen-parakeet/build/nemo-speech \
+  build/package/ZenCode.app
+build/package/ZenCode.app/Contents/MacOS/ZenCode --set-model /absolute/model.gguf
+open build/package/ZenCode.app
+```
+
+The output path must not already exist. Use a fresh destination for each build;
+a failed operation may leave an incomplete output. Packaging deliberately omits
+saved developer model paths and discovers dependencies only in the supplied
+SDK's flat `lib` directory. Unknown non-system dependency paths fail explicitly.
+The packager is Zen using `std.proc` argument vectors; it does not invoke a shell
+or introduce native forwarding shims.
+
+Run `python3 tests/packaging/run.py` after building both targets. It relocates the
+bundle to a temporary path containing spaces, checks dependency paths and code
+signatures, exercises user configuration with an isolated home directory, and
+proves a missing bundled library cannot silently fall back to the SDK. On hosts
+that permit applying a local sandbox, add `--deny-sdk` to verify launching with
+all reads of the original SDK explicitly denied. These checks are headless and
+do not access the microphone or load model weights.
+
+Ad-hoc signing is for local development; this is not Developer ID signing or
+notarization, and does not establish Gatekeeper acceptance or compatibility on a
+fresh Mac. Only the local Apple-silicon host has been tested. Native SDK/model
+redistribution terms still apply; model weights are not bundled or downloaded.

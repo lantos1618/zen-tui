@@ -29,5 +29,10 @@ build = (b :: Builder) Res<(), BuildError> {
         ],
         out: Ok(Path("app/ZenCode.app/Contents/MacOS/ZenCode")),
     }).try();
+    b.exe("zen-package", {
+        src: Path("tools/package.zen"),
+        deps: [],
+        out: Ok(Path("build/zen-package")),
+    }).try();
     Ok(())
 }

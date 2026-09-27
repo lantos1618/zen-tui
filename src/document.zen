@@ -1,0 +1,201 @@
+Ptr, null_ptr = std.mem
+str_at, validate_utf8 = std.text
+replace, FileError = macos.file
+
+DocumentError* = | Capacity
+    | InvalidUtf8
+    | Io
+    | Conflict
+    | NoPath
+    | PathTooLong
+    | InvalidPath
+
+// Main-thread document. All byte buffers belong to the caller's allocator.
+// Positions are UTF-8 scalar boundaries, not grapheme clusters. Undo retains
+// one complete edit; a rejected operation leaves both text and undo intact.
+Document* = {
+    bytes: Ptr<u8>, previous: Ptr<u8>, baseline: Ptr<u8>, staging: Ptr<u8>,
+    path_bytes: Ptr<u8>, capacity: usize,
+    used :: usize, position :: usize, previous_used :: usize,
+    previous_position :: usize, baseline_used :: usize, path_used :: usize,
+    can_undo :: bool,
+
+    create* = (a: Alloc, capacity: usize) Res<Document, AllocError> {
+        Ok(Document(
+            bytes: a.realloc<u8>(null_ptr<u8>(), capacity).try(),
+            previous: a.realloc<u8>(null_ptr<u8>(), capacity).try(),
+            baseline: a.realloc<u8>(null_ptr<u8>(), capacity).try(),
+            staging: a.realloc<u8>(null_ptr<u8>(), capacity).try(),
+            path_bytes: a.realloc<u8>(null_ptr<u8>(), 4096).try(),
+            capacity: capacity,
+            used: 0,
+            position: 0,
+            previous_used: 0,
+            previous_position: 0,
+            baseline_used: 0,
+            path_used: 0,
+            can_undo: false
+        ))
+    }
+    view* = (self: @Self) str { str_at(self.bytes, self.used) }
+    path* = (self: @Self) str { str_at(self.path_bytes, self.path_used) }
+    cursor* = (self: @Self) usize { self.position }
+    dirty* = (self: @Self) bool {
+        !self.view().eq(str_at(self.baseline, self.baseline_used))
+    }
+    remember = (self :: @Self) () {
+        self.previous.copy_from(self.bytes, self.used);
+        self.previous_used     = self.used;
+        self.previous_position = self.position;
+        self.can_undo          = true;
+    }
+    insert* = (self :: @Self, text: str) Res<(), DocumentError> {
+        (text.len > self.capacity - self.used).then(
+            () { Err(DocumentError.Capacity).try(); }
+        );
+        validate_utf8(text).match({Ok(_) => (), Err(_) => { Err(DocumentError.InvalidUtf8).try(); }});
+        (text.len > 0).then(() {
+            // Stage first: the caller may be inserting a borrowed document slice.
+            self.staging.copy_from(text.ptr(), text.len);
+            self.remember();
+            index ::= self.used;
+            loop(index > self.position, (h) {
+                index = index - 1;
+                self.bytes.write(index + text.len, self.bytes.read(index));
+            });
+            self.bytes.offset(self.position).copy_from(self.staging, text.len);
+            self.used     = self.used + text.len;
+            self.position = self.position + text.len;
+        });
+        Ok(())
+    }
+    left* = (self :: @Self) () {
+        (self.position > 0).then(() {
+            self.position = self.position - 1;
+            loop(
+                self.position > 0 && self.bytes.read(self.position) >= 128 && self.bytes.read(self.position) < 192,
+                (h) { self.position = self.position - 1; }
+            );
+        });
+    }
+    right* = (self :: @Self) () {
+        (self.position < self.used).then(() {
+            self.position = self.position + 1;
+            loop(
+                self.position < self.used && self.bytes.read(self.position) >= 128 && self.bytes.read(self.position) < 192,
+                (h) { self.position = self.position + 1; }
+            );
+        });
+    }
+    home* = (self :: @Self) () {
+        loop(
+            self.position > 0 && self.bytes.read(self.position - 1) != 10,
+            (h) { self.left(); }
+        );
+    }
+    end* = (self :: @Self) () {
+        loop(
+            self.position < self.used && self.bytes.read(self.position) != 10,
+            (h) { self.right(); }
+        );
+    }
+    up* = (self :: @Self) () {
+        original = self.position;
+        column: usize ::= 0;
+        loop(
+            self.position > 0 && self.bytes.read(self.position - 1) != 10,
+            (h) { self.left(); column = column + 1; }
+        );
+        (self.position == 0).match({
+            true  => { self.position = original; },
+            false => {
+                self.left(); self.home();
+                loop(
+                    column > 0 && self.position < self.used && self.bytes.read(
+                        self.position
+                    ) != 10,
+                    (h) { self.right(); column = column - 1; }
+                );
+            },
+        });
+    }
+    down* = (self :: @Self) () {
+        original = self.position;
+        column: usize ::= 0;
+        loop(
+            self.position > 0 && self.bytes.read(self.position - 1) != 10,
+            (h) { self.left(); column = column + 1; }
+        );
+        self.end();
+        (self.position == self.used).match({
+            true  => { self.position = original; },
+            false => {
+                self.right();
+                loop(
+                    column > 0 && self.position < self.used && self.bytes.read(
+                        self.position
+                    ) != 10,
+                    (h) { self.right(); column = column - 1; }
+                );
+            },
+        });
+    }
+    backspace* = (self :: @Self) bool {
+        (self.position > 0).match({
+            false => false,
+            true  => {
+                self.remember();
+                old = self.position;
+                self.left();
+                removed = old - self.position;
+                Range(old, self.used).loop((i) { self.bytes.write(i - removed, self.bytes.read(i)); });
+                self.used = self.used - removed;
+                true
+            },
+        })
+    }
+    undo* = (self :: @Self) bool {
+        self.can_undo.match({
+            false => false,
+            true  => {
+                self.bytes.copy_from(self.previous, self.previous_used);
+                self.used     = self.previous_used;
+                self.position = self.previous_position;
+                self.can_undo = false;
+                true
+            },
+        })
+    }
+    // scratch must not own this document's buffers; callers may release it
+    // after return. Loading an existing file intentionally replaces this model.
+    load* = (self :: @Self, env: Env, scratch: Alloc, path: str) Res<(), DocumentError> {
+        (path.len == 0 || path.len > 4096).then(
+            () { Err(DocumentError.PathTooLong).try(); }
+        );
+        (path.contains(0)).then(() { Err(DocumentError.InvalidPath).try(); });
+        contents = env.fs.read(scratch, path).match({Ok(value) => Ok(value), Err(_) => Err(DocumentError.Io)}).try();
+        (contents.len() > self.capacity).then(
+            () { Err(DocumentError.Capacity).try(); }
+        );
+        validate_utf8(contents.view()).match({Ok(_) => (), Err(_) => { Err(DocumentError.InvalidUtf8).try(); }});
+        self.bytes.copy_from(contents.view().ptr(), contents.len());
+        self.baseline.copy_from(contents.view().ptr(), contents.len());
+        self.path_bytes.copy_from(path.ptr(), path.len);
+        self.used = contents.len(); self.baseline_used = contents.len();
+        self.path_used = path.len; self.position = 0; self.can_undo = false;
+        Ok(())
+    }
+    // Compare exact bytes against the loaded/saved baseline before writing.
+    // This detects prior external edits/deletions, but is not a filesystem CAS:
+    // another process can still race between this check and atomic publication.
+    // macos.file stages and syncs bytes before replacing the destination.
+    save* = (self :: @Self, env: Env, scratch: Alloc) Res<(), DocumentError> {
+        (self.path_used == 0).then(() { Err(DocumentError.NoPath).try(); });
+        current = env.fs.read(scratch, self.path()).match({Ok(value) => Ok(value), Err(_) => Err(DocumentError.Io)}).try();
+        (!current.view().eq(str_at(self.baseline, self.baseline_used))).then(() { Err(DocumentError.Conflict).try(); });
+        replace(scratch, self.path(), self.view(), true).match({Ok(_) => (), Err(_) => { Err(DocumentError.Io).try(); }});
+        self.baseline.copy_from(self.bytes, self.used);
+        self.baseline_used = self.used;
+        Ok(())
+    }
+}

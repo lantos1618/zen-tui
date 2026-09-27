@@ -1,0 +1,75 @@
+// Optional recording export is app policy. DSP lives in audio and atomic file
+// publication lives in macos; neither belongs in the UI callback.
+encode_wav, WavError = audio
+replace, FileError = macos.file
+Ptr, null_ptr = std.mem
+str_at = std.text
+
+MAX_EXPORT_SAMPLES*: usize = 480000
+
+Writer = {}
+Writer.impl(Actor, {
+    save = (self :: @Self, ctx: Context, path: str, pcm: str, rate: u32) {
+        // Each message owns a scratch arena that drops after its file operation.
+        scratch ::= ctx.env.mem.alloc();
+        count = pcm.len / 4;
+        scratch.realloc<f32>(null_ptr<f32>(), count).match({
+            Err(_)      => println(
+                "Could not allocate recording export buffer"
+            ),
+            Ok(samples) => {
+                samples.to<u8>().copy_from(pcm.ptr(), pcm.len);
+                encode_wav(scratch, samples, count, rate).match({
+                    Err(_)  => println("Could not encode recording segment"),
+                    Ok(wav) => replace(
+                        scratch,
+                        path,
+                        wav.view(),
+                        ctx.env.fs.exists(path)
+                    ).match({
+                        Ok(_)  => println(
+                            "Saved completed recording segment to {}",
+                            path
+                        ),
+                        Err(_) => println("Could not write recording segment")
+                    })
+                });
+            }
+        });
+    }
+})
+
+Exporter* = {
+    worker: Ref<Writer>,
+    path: str,
+    closed :: bool,
+
+    // The caller's allocator must outlive this handle. Message admission copies
+    // both path and PCM, so the capture prefix can immediately be discarded.
+    open* = (env: Env, path: str, a: Alloc) Res<Exporter, ActorStartError> {
+        (!path.is_empty() && !path.contains(0)).ensure(ActorStartError.Unavailable).try();
+        owned  = a.String("{}", path).try(ActorStartError.OutOfMemory);
+        worker = env.spawn(Writer()).try();
+        Ok(Exporter(worker: worker, path: owned.view(), closed: false))
+    }
+
+    // The actor runtime bounds its pending mailbox at 64 messages. A request
+    // is capped at 30 s of 16 kHz mono audio (1,920,000 PCM bytes). Full also
+    // rejects invalid/oversized sample requests before touching their pointer.
+    enqueue* = (self: @Self, samples: Ptr<f32>, count: usize, rate: u32)
+               Res<(), ActorError> {
+        (!self.closed).ensure(ActorError.Closed).try();
+        (count > 0 && count <= MAX_EXPORT_SAMPLES && !samples.is_null()
+            && rate > 0 && rate <= 1073741823).ensure(ActorError.Full).try();
+        self.worker.save(self.path, str_at(samples.to<u8>(), count * 4), rate)
+    }
+
+    // Close admission and drain accepted exports before releasing caller state.
+    close* = (self :: @Self) () {
+        (!self.closed).then(() {
+            self.closed = true;
+            self.worker.stop();
+            self.worker.join();
+        });
+    }
+}

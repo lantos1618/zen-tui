@@ -1,11 +1,13 @@
 App, Config = macos
 Transcriber, Transcript, MailboxError, Live, quiet_tail = voice
 History, recent_text = history
+Editor, DocumentError = editor
 load_model, configure_model = config
 CAPTURE_OVERFLOW = macos.audio
-Error = AllocError | ActorStartError | ActorError | MailboxError
+Error = AllocError | ActorStartError | ActorError | MailboxError | DocumentError
 Ptr, null_ptr = std.mem
-analyze, voice_bands, smooth_levels, encode_wav = audio
+analyze, voice_bands, smooth_levels = audio
+Exporter, MAX_EXPORT_SAMPLES = export
 Audio, decode = parakeet.wav
 
 main = (env: Env) Res<i32, Error> {
@@ -16,7 +18,12 @@ main = (env: Env) Res<i32, Error> {
     help.match({
         true  => {
             println("Zen Code — a native workspace powered by zen-macos");
-            println("Usage: ZenCode [--smoke] [--check-config] [--help]");
+            println(
+                "Usage: ZenCode [--file PATH] [--smoke] [--check-config] [--help]"
+            );
+            println(
+                "--file edits an existing UTF-8 file: arrows, Cmd-Z undo, Cmd-S save; F2 dictates at cursor."
+            );
             println("F2 records your voice. Enter speaks text. Escape closes.");
             println("--smoke renders a bounded number of frames and exits.");
             println(
@@ -59,16 +66,25 @@ run = (env: Env) Res<i32, Error> {
     arena       ::= env.mem.alloc();
     transcriber ::= Transcriber.open(env, arena).try();
     @scope.defer(() { transcriber.close(); });
-    app ::= App.configured(
+    exporter: Res<Exporter> = env.var("ZEN_RECORDING_PATH").match({
+        Ok(path) => Ok(Exporter.open(env, path, arena).try()),
+        None     => None,
+    });
+    @scope.defer(
+        () { exporter.match({Ok(value) => { owner ::= value; owner.close(); }, None => ()}); }
+    );
+    editor ::= Editor.open(env, arena).try();
+    app    ::= App.configured(
         arena,
         Config(
-            title: "Zen Code",
+            title: editor.enabled.match({true => editor.path(), false => "Zen Code"}),
             heading: "ZEN CODE",
-            description: "LOCAL VOICE / METAL\n\nF2 starts/stops microphone capture.\nEnter speaks typed text · Escape closes.",
+            description: editor.enabled.match({true => "DOCUMENT / LOCAL VOICE\n\nArrows move · Cmd-Z undoes · Cmd-S saves · F2 dictates\nEscape closes · Cmd-Shift-Q discards unsaved edits", false => "LOCAL VOICE / METAL\n\nF2 starts/stops microphone capture.\nEnter speaks typed text · Escape closes."}),
             prompt: "you › ",
             greeting: "Welcome to Zen Code.",
             spectrum_label: "Voice FFT 80 Hz–4 kHz",
-            input_tail_bytes: 600
+            input_tail_bytes: editor.enabled.match({true => 0, false => 600}),
+            editable: editor.enabled
         )
     ).try();
     // Defers run in reverse registration order: close capture and native UI
@@ -89,6 +105,7 @@ run = (env: Env) Res<i32, Error> {
             "Transcription off · set ZEN_PARAKEET_MODEL"
         ).try(),
     });
+    editor.enabled.then(() { editor.show(arena, app, "").try(); });
     (!app.begin(arena).try()).match({
         true  => Ok(1),
         false => {
@@ -108,25 +125,16 @@ run = (env: Env) Res<i32, Error> {
             ).match({Ok(_) => true, None => false});
             voice_ready     ::= false;
             voice_submitted ::= env.clock.since_start().ns;
-            voice_smoke.then(() {
-                env.var("ZEN_TRANSCRIBE_WAV").match({
-                    Ok(path) => env.fs.read(arena, path).match({
-                        Ok(bytes) => decode(arena, bytes.view()).match({
-                            Ok(audio) => model.match({
-                                Ok(path) => {
-                                    voice_submitted = env.clock.since_start().ns;
-                                    transcriber.submit(
-                                        path,
-                                        0,
-                                        audio.samples,
-                                        audio.count,
-                                        audio.rate
-                                    ).try(); },
-                                None     => (),
-                            }),
-                            _         => (),
-                        }),
-                        _         => (),
+            model_ready     ::= false;
+            (!smoke).then(() {
+                model.match({
+                    Ok(path) => (path.len > 0).then(() {
+                        app.allow_capture(false);
+                        transcriber.prepare(path, 0).try();
+                        app.set_notice(
+                            arena,
+                            "Loading and warming local model · microphone starts when ready"
+                        ).try();
                     }),
                     None     => (),
                 });
@@ -136,6 +144,7 @@ run = (env: Env) Res<i32, Error> {
             live             ::= Live();
             saved_generation ::= 0;
             overflow_shown   ::= false;
+            export_failed    ::= false;
             loop(running && (!smoke || (app.frames < 60 && env.clock.since_start().ns - smoke_started < 30000000000)) && (!voice_smoke || (env.clock.since_start().ns - smoke_started < 30000000000 && !voice_ready)), (
                 h
             ) {
@@ -162,8 +171,19 @@ run = (env: Env) Res<i32, Error> {
                 last_frame = now;
                 app.spectrum(levels);
                 running = app.tick(scratch).try();
+                editor.enabled.then(() {
+                    app.take_key().match({
+                        Ok(key) => { running = editor.key(
+                            env,
+                            scratch,
+                            app,
+                            key
+                        ).try() && running; },
+                        None    => (),
+                    });
+                });
                 (live.session != app.microphone.session()).then(
-                    () { history.reset(); overflow_shown = false; }
+                    () { history.reset(); overflow_shown = false; export_failed = false; }
                 );
                 live.observe(app.microphone.session());
                 (app.microphone.generation() != saved_generation).then(() {
@@ -173,20 +193,52 @@ run = (env: Env) Res<i32, Error> {
                         None  => {
                             recording = app.microphone.recording();
                             (recording.count > 0).then(
-                                () { save_segment(
-                                    env,
-                                    scratch,
+                                () { export_failed = !queue_segment(
+                                    exporter,
                                     recording.data,
                                     recording.count,
                                     recording.rate
-                                ); }
+                                ) || export_failed; }
                             );
                         },
                     });
                 });
 
                 transcriber.poll().try().match({
-                    Ok(reply) => (voice_smoke || live.current(reply.session)).then(() {
+                    Ok(reply) => reply.preparation.match({
+                        true  => {
+                            model_ready = reply.success;
+                            app.allow_capture(reply.success);
+                            reply.success.match({
+                                true  => {
+                                    app.set_notice(
+                                        scratch,
+                                        "Parakeet ready · F2 starts dictation"
+                                    ).try();
+                                    voice_smoke.then(() {
+                                        voice_submitted = env.clock.since_start().ns;
+                                        submit_fixture(
+                                            env,
+                                            scratch,
+                                            transcriber,
+                                            model
+                                        ).try();
+                                    });
+                                },
+                                false => {
+                                    println(
+                                        "Model preparation failed: {}",
+                                        reply.text
+                                    );
+                                    app.set_notice(
+                                        scratch,
+                                        "Model preparation failed · check the configured path"
+                                    ).try();
+                                    voice_smoke.then(() { running = false; });
+                                },
+                            });
+                        },
+                        false => (voice_smoke || live.current(reply.session)).then(() {
                         reply_received = env.clock.since_start().ns;
                         reply.success.match({
                             true  => {
@@ -199,7 +251,7 @@ run = (env: Env) Res<i32, Error> {
                                         ).try();
                                         println("Transcript: {}", reply.text);
                                         println(
-                                            "zen-code: submit-to-reply {} ms (includes model load, actor delivery, inference and UI polling; excludes capture)",
+                                            "zen-code: warm submit-to-reply {} ms (includes actor delivery, inference and UI polling; excludes model preparation and capture)",
                                             (reply_received - voice_submitted) / 1000000
                                         );
                                     },
@@ -207,19 +259,22 @@ run = (env: Env) Res<i32, Error> {
                                         reply.final.then(() {
                                             recording = app.microphone.recording();
                                             (reply.count <= recording.count).match({
-                                                false => { live.fail(); app.microphone.stop(); },
+                                                false => { live.fail(); app.microphone.stop(); (); },
                                                 true  => {
-                                                    history.commit(
-                                                        scratch,
-                                                        reply.text
-                                                    ).try();
-                                                    save_segment(
-                                                        env,
-                                                        scratch,
+                                                    editor.enabled.match({
+                                                        true  => (!editor.transcript(scratch, app, reply.text, true).try()).then(() { live.fail(); app.microphone.stop(); }),
+                                                        false => history.commit(
+                                                            scratch,
+                                                            reply.text
+                                                        ).try(),
+                                                    });
+                                                    (!live.failed).then(() {
+                                                    export_failed = !queue_segment(
+                                                        exporter,
                                                         recording.data,
                                                         reply.count,
                                                         recording.rate
-                                                    );
+                                                    ) || export_failed;
                                                     app.microphone.discard_prefix(
                                                         reply.count
                                                     ).match({
@@ -228,11 +283,23 @@ run = (env: Env) Res<i32, Error> {
                                                             app.microphone.recording().count,
                                                             app.microphone.active()
                                                         ); },
-                                                        false => { live.fail(); app.microphone.stop(); },
+                                                        false => { live.fail(); app.microphone.stop(); (); },
                                                     });
+                                                    });
+                                                    ();
                                                 },
                                             });
                                         });
+                                        editor.enabled.match({
+                                            true  => (!reply.final).then(
+                                                () { editor.transcript(
+                                                    scratch,
+                                                    app,
+                                                    reply.text,
+                                                    false
+                                                ).try(); }
+                                            ),
+                                            false => {
                                         displayed = history.render(
                                             scratch,
                                             reply.final.match({true => "",false => reply.text})
@@ -241,6 +308,8 @@ run = (env: Env) Res<i32, Error> {
                                             scratch,
                                             displayed.view()
                                         ).try();
+                                            },
+                                        });
                                     },
                                 });
                                 (!overflow_shown).then(() { app.set_notice(scratch,live.failed.match({
@@ -262,9 +331,10 @@ run = (env: Env) Res<i32, Error> {
                             },
                         });
                     }),
+                    }),
                     None      => (),
                 });
-                (running && !voice_smoke).then(() {
+                (running && !voice_smoke && model_ready).then(() {
                     recording = app.microphone.recording();
                     active    = app.microphone.active();
                     chosen    = live.segment_count(recording.count);
@@ -293,6 +363,12 @@ run = (env: Env) Res<i32, Error> {
                     ).try();
                     overflow_shown = true;
                 });
+                export_failed.then(
+                    () { app.set_notice(
+                        scratch,
+                        "Recording export queue full or closed · dictation continues; check the runtime log"
+                    ).try(); }
+                );
             });
             println(
                 "zen-code: {} Metal frames · display link {} · submit {} FPS · p95 {} ms · p99 {} ms",
@@ -309,26 +385,49 @@ run = (env: Env) Res<i32, Error> {
     })
 }
 
-// Explicit opt-in export overwrites the requested file with each completed
-// segment, not a claim that an unbounded dictation session fits one WAV.
-save_segment = (
-    env     : Env,
-    a       : Alloc,
-    samples : Ptr<f32>,
-    count   : usize,
-    rate    : u32
-) () {
-    env.var("ZEN_RECORDING_PATH").match({
-        None     => (),
-        Ok(path) => encode_wav(a, samples, count, rate).match({
-            Err(_)  => println("Could not encode recording segment"),
-            Ok(wav) => env.fs.write(path, wav.view()).match({
-                Ok(_)  => println(
-                    "Saved completed recording segment to {}",
-                    path
-                ),
-                Err(_) => println("Could not write recording segment"),
-            }),
+// Export admission copies PCM; encoding and atomic publication run on its actor.
+queue_segment = (
+    exporter : Res<Exporter>,
+    samples  : Ptr<f32>,
+    count    : usize,
+    rate     : u32
+) bool {
+    exporter.match({
+        None       => true,
+        Ok(writer) => writer.enqueue(samples, count, rate).match({
+            Ok(_)  => true,
+            Err(_) => { println(
+                "Recording export refused: queue full, closed or invalid segment"
+            ); false },
         }),
+    })
+}
+
+// Fixture decoding stays outside the worker for explicit smoke tests only.
+submit_fixture = (
+    env         : Env,
+    a           : Alloc,
+    transcriber :: Transcriber,
+    model       : Res<str>
+) Res<(), Error> {
+    env.var("ZEN_TRANSCRIBE_WAV").match({
+        Ok(path) => env.fs.read(a, path).match({
+            Ok(bytes) => decode(a, bytes.view()).match({
+                Ok(audio) => model.match({
+                    Ok(path) => { transcriber.submit(
+                        path,
+                        0,
+                        audio.samples,
+                        audio.count,
+                        audio.rate
+                    ).try(); },
+                    None     => (),
+                }),
+                _         => (),
+            }),
+            _         => (),
+        }),
+        None     => (),
     });
+    Ok(())
 }

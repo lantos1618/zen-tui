@@ -1,36 +1,95 @@
 resource_directory = macos.bundle
+replace, FileError = macos.file
 
-// Model configuration is local to this installation, never downloaded at launch.
-// Return views owned by the caller's app-lifetime allocator or by Env.
+// Model paths belong to the user, not the signed application bundle. The
+// environment override wins, including an empty value that disables inference.
+settings_directory = (env: Env, a: Alloc) Res<Res<str>, AllocError> {
+    env.var("HOME").match({
+        None     => Ok(None),
+        Ok(home) => home.starts_with("/").match({
+            false => Ok(None),
+            true  => {
+                directory = a.String(
+                    "{}/Library/Application Support/dev.zen.code",
+                    home
+                ).try();
+                Ok(Ok(directory.view()))
+            }
+        })
+    })
+}
+
+legacy_model = (env: Env, a: Alloc) Res<Res<str>, AllocError> {
+    resource_directory(a).try().match({
+        None          => Ok(None),
+        Ok(directory) => {
+            path = a.String("{}/model-path.txt", directory.view()).try();
+            env.fs.read(a, path.view()).match({
+                Ok(value) => Ok(value.view().trim()),
+                Err(_)    => Ok(None)
+            })
+        }
+    })
+}
+
+// Return views owned by the caller's app-lifetime allocator or by Env. Old
+// development installations keep working until the next explicit --set-model.
 load_model* = (env: Env, a: Alloc) Res<Res<str>, AllocError> {
-    override = env.var("ZEN_PARAKEET_MODEL");
-    override.match({
+    env.var("ZEN_PARAKEET_MODEL").match({
         Ok(path) => Ok(path.trim()),
-        None     => resource_directory(a).try().match({
-            None          => Ok(None),
+        None     => settings_directory(env, a).try().match({
+            None          => legacy_model(env, a),
             Ok(directory) => {
-                path = a.String("{}/model-path.txt", directory.view()).try();
+                path = a.String("{}/model-path.txt", directory).try();
                 env.fs.read(a, path.view()).match({
                     Ok(value) => Ok(value.view().trim()),
-                    Err(_)    => Ok(None),
+                    Err(_)    => legacy_model(env, a)
                 })
-            },
-        }),
+            }
+        })
+    })
+}
+
+prepare_directory = (env: Env, a: Alloc, directory: str) Res<bool, AllocError> {
+    home    = env.var("HOME").value_or("");
+    library = a.String("{}/Library", home).try();
+    support = a.String("{}/Library/Application Support", home).try();
+    ready   = env.fs.mkdir(
+        library.view()
+    ).match({ Ok(_) => true, Err(_) => false });
+    ready.match({
+        false => Ok(false),
+        true  => env.fs.mkdir(support.view()).match({
+            Err(_) => Ok(false),
+            Ok(_)  => Ok(
+                env.fs.mkdir(
+                    directory
+                ).match({ Ok(_) => true, Err(_) => false })
+            )
+        })
     })
 }
 
 configure_model* = (env: Env, a: Alloc, model: str) Res<bool, AllocError> {
     (model.starts_with("/") && env.fs.exists(model) && !env.fs.is_dir(model)).match({
         false => { println("Use an absolute path to an existing local model."); Ok(false) },
-        true  => resource_directory(a).try().match({
-            None          => { println("Run configuration from the Zen Code app bundle."); Ok(false) },
-            Ok(directory) => {
-                target = a.String("{}/model-path.txt", directory.view()).try();
-                env.fs.write(target.view(), model).match({
-                    Ok(_)  => { println("Zen Code local model configured."); Ok(true) },
-                    Err(_) => { println("Cannot write model configuration in this development bundle."); Ok(false) },
-                })
-            },
-        }),
+        true  => settings_directory(env, a).try().match({
+            None          => { println("Cannot locate the user's Application Support directory."); Ok(false) },
+            Ok(directory) => prepare_directory(env, a, directory).try().match({
+                false => { println("Cannot create the user's Zen Code settings directory."); Ok(false) },
+                true  => {
+                    target = a.String("{}/model-path.txt", directory).try();
+                    replace(
+                        a,
+                        target.view(),
+                        model,
+                        env.fs.exists(target.view())
+                    ).match({
+                        Ok(_)  => { println("Zen Code local model configured."); Ok(true) },
+                        Err(_) => { println("Cannot write Zen Code model configuration."); Ok(false) }
+                    })
+                }
+            })
+        })
     })
 }

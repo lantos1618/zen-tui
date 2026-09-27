@@ -1,0 +1,188 @@
+// Bundle policy belongs to the app. Process arguments never pass through a shell.
+Alloc, AllocError = std.mem
+Vec, vararg = std.collections
+str, String = std.text
+ProcError = std.proc
+FsError = std.env
+
+PackageFault = Invalid | CommandFailed
+PackageError = AllocError | ProcError | FsError | PackageFault
+
+Packer = {
+    env: Env,
+    a: Alloc,
+    sdk: str,
+    output: str,
+
+    run = (self: @Self, args: vararg<str>) Res<String, PackageError> {
+        argv ::= self.a.Vec<str>();
+        Range(0, args.len).loop((i) { argv.add(args.get(i).value_or("")).try(); });
+        result = self.env.proc.run_argv(self.a, "", argv).try();
+        (result.code != 0).then(() {
+            println("Packaging command failed: {}", args.get(0).value_or(""));
+            println("{}", result.err.view());
+        });
+        (result.code == 0).ensure(PackageFault.CommandFailed).try();
+        Ok(result.out)
+    }
+
+    join = (self: @Self, left: str, right: str) Res<str, PackageError> {
+        text = self.a.String("{}/{}", left, right).try();
+        Ok(text.view())
+    }
+
+    framework = (self: @Self, name: str) Res<str, PackageError> {
+        dir = self.join(self.output, "Contents/Frameworks").try();
+        self.join(dir, name)
+    }
+
+    // Restrict resolution to the SDK's flat lib directory. Unknown absolute
+    // dependencies fail rather than copying arbitrary host software silently.
+    library = (self: @Self, dependency: str) Res<str, PackageError> {
+        dependency.starts_with("@rpath/").ensure(PackageFault.Invalid).try();
+        name = dependency.slice(7, dependency.len);
+        (!name.is_empty() && !name.contains(47) && name.ends_with(".dylib"))
+            .ensure(PackageFault.Invalid).try();
+        directory = self.join(self.sdk, "lib").try();
+        source    = self.join(directory, name).try();
+        self.env.fs.exists(source).ensure(PackageFault.Invalid).try();
+        Ok(name)
+    }
+
+    patch = (self: @Self, file: str, executable: bool, names :: Vec<str>)
+            Res<(), PackageError> {
+        listing = self.run("/usr/bin/otool", "-L", file).try();
+        listing.view().split(10).loop((h, index, raw) {
+            (index > 0).then(() {
+                line = raw.trim().value_or("");
+                (!line.is_empty()).then(() {
+                    end    = line.find(" (compatibility version").ok_or(PackageFault.Invalid).try();
+                    dep    = line.slice(0, end);
+                    system = dep.starts_with("/usr/lib/") || dep.starts_with("/System/Library/");
+                    (!system).then(() {
+                        name = self.library(dep).try();
+                        seen ::= false;
+                        names.loop((entry) { seen = seen || entry.eq(name); });
+                        (!seen).then(() { names.add(name).try(); });
+                        prefix = executable.match({
+                            true => "@executable_path/../Frameworks", false => "@loader_path"
+                        });
+                        target = self.join(prefix, name).try();
+                        self.run(
+                            "/usr/bin/install_name_tool",
+                            "-change",
+                            dep,
+                            target,
+                            file
+                        ).try();
+                    });
+                });
+            });
+        });
+        // No host or build rpaths survive, including transitive SDK paths.
+        loads = self.run("/usr/bin/otool", "-l", file).try();
+        loads.view().split(10).loop((h, raw) {
+            line = raw.trim().value_or("");
+            line.starts_with("path ").then(() {
+                end  = line.find(" (offset ").ok_or(PackageFault.Invalid).try();
+                path = line.slice(5, end);
+                self.run(
+                    "/usr/bin/install_name_tool",
+                    "-delete_rpath",
+                    path,
+                    file
+                ).try();
+            });
+        });
+        Ok(())
+    }
+
+    package = (self: @Self, input: str) Res<(), PackageError> {
+        (!self.env.fs.exists(self.output)).ensure(PackageFault.Invalid).try();
+        executable = self.join(input, "Contents/MacOS/ZenCode").try();
+        info       = self.join(input, "Contents/Info.plist").try();
+        licenses   = self.join(self.sdk, "share/licenses/nemo-speech").try();
+        (self.env.fs.exists(executable) && self.env.fs.exists(info)
+            && self.env.fs.is_dir(licenses)).ensure(PackageFault.Invalid).try();
+        macos      = self.join(self.output, "Contents/MacOS").try();
+        frameworks = self.join(self.output, "Contents/Frameworks").try();
+        resources  = self.join(self.output, "Contents/Resources").try();
+        self.run("/bin/mkdir", "-p", macos, frameworks, resources).try();
+        self.run(
+            "/bin/cp",
+            info,
+            self.join(self.output, "Contents/Info.plist").try()
+        ).try();
+        binary = self.join(macos, "ZenCode").try();
+        self.run("/bin/cp", executable, binary).try();
+        self.run(
+            "/usr/bin/ditto",
+            licenses,
+            self.join(resources, "NativeLicenses").try()
+        ).try();
+        names ::= self.a.Vec<str>();
+        self.patch(binary, true, names).try();
+        index: usize ::= 0;
+        loop(index < names.len, (h) {
+            name   = names.get(index).ok_or(PackageFault.Invalid).try();
+            source = self.join(self.join(self.sdk, "lib").try(), name).try();
+            dest   = self.framework(name).try();
+            self.run("/bin/cp", "-L", source, dest).try();
+            self.run("/bin/chmod", "u+w", dest).try();
+            self.patch(dest, false, names).try();
+            identity = self.join("@rpath", name).try();
+            self.run("/usr/bin/install_name_tool", "-id", identity, dest).try();
+            self.run("/usr/bin/codesign", "--force", "--sign", "-", dest).try();
+            index = index + 1;
+        });
+        self.run(
+            "/usr/bin/codesign",
+            "--force",
+            "--sign",
+            "-",
+            self.output
+        ).try();
+        self.run(
+            "/usr/bin/codesign",
+            "--verify",
+            "--deep",
+            "--strict",
+            self.output
+        ).try();
+        println("Packaged {} native libraries in {}", names.len, self.output);
+        println(
+            "Ad-hoc development signature only. Configure an external model after copying."
+        );
+        Ok(())
+    }
+}
+
+main = (env: Env) Res<i32, AllocError> {
+    (env.argv.len != 4).then(() {
+        println("Usage: zen-package INPUT.app SDK_DIRECTORY OUTPUT.app");
+        println("Output must not exist. Input app and SDK are left untouched.");
+    });
+    (env.argv.len == 4).match({
+        false => Ok(2),
+        true  => {
+            packer = Packer(
+                env: env,
+                a: env.mem.alloc(),
+                sdk: env.argv.get(2).value_or(""),
+                output: env.argv.get(3).value_or("")
+            );
+            packer.package(env.argv.get(1).value_or("")).match({
+                Ok(_)  => Ok(0),
+                Err(_) => {
+                    println(
+                        "Packaging failed. Check inputs, SDK dependency paths and Apple developer tools."
+                    );
+                    println(
+                        "A partial output may remain; use a fresh output path after correcting the error."
+                    );
+                    Ok(1)
+                }
+            })
+        }
+    })
+}

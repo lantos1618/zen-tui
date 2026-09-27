@@ -1,0 +1,124 @@
+App, KeyEvent = macos
+Document, DocumentError* = document
+recent_text = history
+
+// App policy: document editing is explicitly selected with --file PATH.
+Editor* = {
+    document :: Document,
+    enabled*: bool,
+    open* = (env: Env, a: Alloc) Res<Editor, AllocError | DocumentError> {
+        document ::= Document.create(a, 65536).try();
+        enabled = env.argv.get(1).match({Ok(arg) => arg.eq("--file"), None => false});
+        enabled.then(() {
+            path = env.argv.get(2).ok_or(DocumentError.NoPath).try();
+            scratch ::= env.mem.alloc();
+            document.load(env, scratch, path).try();
+        });
+        Ok(Editor(document: document, enabled: enabled))
+    }
+    path* = (self: @Self) str { self.document.path() }
+
+    show* = (self: @Self, a: Alloc, app :: App, partial: str) Res<(), AllocError> {
+        text   = self.document.view();
+        at     = self.document.cursor();
+        before = recent_text(text.slice(0, at), 1300);
+        after  = text.slice(at, text.len);
+        end ::= after.len;
+        (end > 1300).then(() {
+            end = 1300;
+            loop(
+                end > 0 && after.ptr().read(end) >= 128 && after.ptr().read(end) < 192,
+                (h) { end = end - 1; }
+            );
+        });
+        preview     = recent_text(partial, 600);
+        prefix: str = (before.len < at).match({true => "…", false => ""});
+        suffix: str = (end < after.len).match({true => "…", false => ""});
+        status: str = self.document.dirty().match({true => "\n[Unsaved]", false => "\n[Saved]"});
+        displayed   = a.String(
+            "{}{}{}│{}{}{}",
+            prefix,
+            before,
+            preview,
+            after.slice(0, end),
+            suffix,
+            status
+        ).try();
+        app.set_input(a, displayed.view()).try();
+        Ok(())
+    }
+    // Partials are only previewed; finalized text becomes one undoable edit.
+    transcript* = (self :: @Self, a: Alloc, app :: App, text: str, final: bool) Res<bool, AllocError> {
+        accepted ::= true;
+        final.then(() {
+            self.document.insert(text).match({
+                Ok(_)  => (),
+                Err(_) => { accepted = false; app.set_notice(
+                    a,
+                    "Document full or invalid text · dictation stopped without consuming audio"
+                ).try(); },
+            });
+        });
+        self.show(a, app, final.match({true => "", false => text})).try();
+        Ok(accepted)
+    }
+    key* = (self :: @Self, env: Env, a: Alloc, app :: App, key: KeyEvent) Res<bool, AllocError> {
+        keep ::= true;
+        ((key.code == 53) || (key.command && key.code == 12)).match({
+            true  => {
+                (self.document.dirty() && !(key.command && key.shift && key.code == 12)).match({
+                    true  => app.set_notice(
+                        a,
+                        "Unsaved changes · Cmd-S saves · Cmd-Shift-Q discards and closes"
+                    ).try(),
+                    false => { keep = false; },
+                });
+            },
+            false => {
+                key.command.match({
+                    true  => {
+                        (key.code == 1).then(() {
+                            self.document.save(env, a).match({
+                                Ok(_)      => app.set_notice(a, "Saved").try(),
+                                Err(error) => error.match({
+                                    DocumentError.Conflict => app.set_notice(
+                                        a,
+                                        "File changed on disk · save refused; your edits remain in memory"
+                                    ).try(),
+                                    _                      => app.set_notice(
+                                        a,
+                                        "Save failed · original file and your edits are preserved"
+                                    ).try(),
+                                }),
+                            });
+                        });
+                        (key.code == 6).then(() { self.document.undo(); });
+                    },
+                    false => {
+                        (key.code == 123).then(() { self.document.left(); });
+                        (key.code == 124).then(() { self.document.right(); });
+                        (key.code == 125).then(() { self.document.down(); });
+                        (key.code == 126).then(() { self.document.up(); });
+                        (key.code == 115).then(() { self.document.home(); });
+                        (key.code == 119).then(() { self.document.end(); });
+                        (key.code == 51).then(
+                            () { self.document.backspace(); }
+                        );
+                        inserted = (key.code == 36).match({true => "\n", false => (key.code == 48).match({true => "\t", false => (key.code < 96 && key.code != 51 && key.text.len > 0 && key.text.ptr().read(
+                            0
+                        ) >= 32).match({true => key.text, false => ""})})});
+                        self.document.insert(inserted).match({
+                            Ok(_)  => (),
+                            Err(_) => app.set_notice(
+                                a,
+                                "Edit rejected · document capacity is 64 KiB of UTF-8"
+                            ).try(),
+                        });
+                    },
+                });
+                self.show(a, app, "").try();
+            },
+        });
+        Ok(keep)
+    }
+}

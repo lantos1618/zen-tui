@@ -1,0 +1,95 @@
+Editor, DocumentError = editor
+App, Config, KeyEvent = macos
+
+press = (
+    editor  :: Editor,
+    env     : Env,
+    a       : Alloc,
+    app     :: App,
+    code    : u16,
+    text    : str,
+    command : bool,
+    shift   : bool
+) Res<bool, AllocError> {
+    editor.key(
+        env,
+        a,
+        app,
+        KeyEvent(code: code, text: text, command: command, shift: shift)
+    )
+}
+contents = (env: Env, a: Alloc, path: str) str {
+    env.fs.read(
+        a,
+        path
+    ).match({Ok(value) => value.view(), Err(_) => "[READ FAILED]"})
+}
+
+main = (env: Env) Res<i32, AllocError | DocumentError> {
+    a = env.mem.alloc();
+    editor ::= Editor.open(env, a).try();
+    app    ::= App.configured(
+        a,
+        Config(
+            title: "Editor integration test",
+            heading: "Test",
+            description: "Hidden native window",
+            prompt: "",
+            greeting: "",
+            editable: true
+        )
+    ).try();
+    good   ::= editor.enabled;
+    path     = editor.path();
+    original = "ab界\nnext";
+    good     = good && contents(env, a, path).eq(original);
+    editor.show(a, app, "").try();
+    good = good && !press(editor, env, a, app, 53, "", false, false).try();
+    press(editor, env, a, app, 124, "", false, false).try();
+    good = good && editor.transcript(a, app, "TEMP", false).try();
+    // Saving while a partial preview is visible must never persist the preview.
+    press(editor, env, a, app, 1, "s", true, false).try();
+    good = good && contents(env, a, path).eq(original);
+    good = good && !press(editor, env, a, app, 53, "", false, false).try();
+    good = good && editor.transcript(a, app, "VOICE ", true).try();
+    good = good && press(editor, env, a, app, 53, "", false, false).try();
+    good = good && press(editor, env, a, app, 12, "q", true, false).try();
+    good = good && !press(editor, env, a, app, 12, "Q", true, true).try();
+    press(editor, env, a, app, 1, "s", true, false).try();
+    good = good && contents(env, a, path).eq("aVOICE b界\nnext");
+    good = good && !press(editor, env, a, app, 53, "", false, false).try();
+    press(editor, env, a, app, 6, "z", true, false).try();
+    good = good && press(editor, env, a, app, 53, "", false, false).try();
+    press(editor, env, a, app, 1, "s", true, false).try();
+    good = good && contents(env, a, path).eq(original);
+    press(editor, env, a, app, 0, "X", false, false).try();
+    press(editor, env, a, app, 124, "", false, false).try();
+    press(editor, env, a, app, 51, "", false, false).try();
+    press(editor, env, a, app, 36, "", false, false).try();
+    press(editor, env, a, app, 48, "", false, false).try();
+    press(editor, env, a, app, 1, "s", true, false).try();
+    saved = "aX\n\t界\nnext";
+    good  = good && contents(env, a, path).eq(saved);
+    env.fs.write(
+        path,
+        "external writer"
+    ).match({Ok(_) => (), Err(_) => { good = false; }});
+    press(editor, env, a, app, 16, "Y", false, false).try();
+    press(editor, env, a, app, 1, "s", true, false).try();
+    good = good && contents(env, a, path).eq("external writer");
+    good = good && press(editor, env, a, app, 53, "", false, false).try();
+    press(editor, env, a, app, 6, "z", true, false).try();
+    oversized ::= a.String().try();
+    Range(0, 65537).loop((i) { oversized.add("x").try(); });
+    good = good && !editor.transcript(a, app, oversized.view(), true).try();
+    env.fs.write(path, saved).match({Ok(_) => (), Err(_) => { good = false; }});
+    press(editor, env, a, app, 1, "s", true, false).try();
+    good = good && contents(env, a, path).eq(saved);
+    good = good && !press(editor, env, a, app, 53, "", false, false).try();
+    app.close(); app.close();
+    println(
+        "editor keys/save/undo/dirty close/partial and final dictation/conflict/capacity: {}",
+        good
+    );
+    Ok(good.match({true => 0, false => 1}))
+}
