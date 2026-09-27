@@ -60,3 +60,28 @@ Completed locally:
 Publication: with explicit approval, zen-voice commit 3295d07 is published at
 https://github.com/lantos1618/zen-voice. Existing public library updates are
 published. Zen Code's dependency migration is commit 3092b5d in zen-tui.
+
+## Frame pacing follow-up (2026-09-27)
+
+- Replace the per-tick 16 ms wait with macOS display-link scheduling, retaining
+  main-run-loop ownership of capture and AppKit. Keep a timed fallback for older
+  systems and identify the active path in diagnostics.
+- Put bounded rolling sample summaries in `std.stats`; the SDK collects frame
+  submission intervals. Label them honestly rather than claiming presented FPS.
+- Use existing `Env.clock` for application elapsed time; keep Core Animation's
+  timestamp domain within the macOS display integration.
+- Close capture/window resources before waiting for noncancellable inference on
+  exit. Document remaining main-thread copies and optional WAV writes.
+- Validate callback lifecycle, allocation failures, numerical summaries,
+  render smoke and real-model voice smoke. Do not infer hitch-free presentation
+  from a short submission counter or the earlier DSP microbenchmarks.
+
+Implemented: display-link scheduling with a deadline fallback, std sample
+statistics and std app-clock usage, honest submission diagnostics, and teardown
+ordering. Fixed an existing SDK construction-cleanup bug caused by capturing a
+partial App by value. Focused statistics, capture, actor/history, ownership and
+short render checks pass. Longer SDK timing diagnostics were inconsistent;
+residual stalls and actual display presentation still need investigation.
+Deferred: frame-time graph, complete capture-to-visible-text tracing, generic
+pollable std actor channel, compiler optimization diagnostics, SIMD, and OTel
+export. None is claimed by the timing overlay.

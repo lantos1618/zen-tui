@@ -7,7 +7,6 @@ Error = AllocError | ActorStartError | ActorError | MailboxError
 Ptr, null_ptr = std.mem
 analyze, voice_bands, smooth_levels, encode_wav = audio
 Audio, decode = parakeet.wav
-monotonic = macos.display
 
 main = (env: Env) Res<i32, Error> {
     help = env.argv.find((arg) { arg.eq("--help") || arg.eq("-h") }).match({
@@ -57,8 +56,10 @@ main = (env: Env) Res<i32, Error> {
 }
 
 run = (env: Env) Res<i32, Error> {
-    arena ::= env.mem.alloc();
-    app   ::= App.configured(
+    arena       ::= env.mem.alloc();
+    transcriber ::= Transcriber.open(env, arena).try();
+    @scope.defer(() { transcriber.close(); });
+    app ::= App.configured(
         arena,
         Config(
             title: "Zen Code",
@@ -70,11 +71,9 @@ run = (env: Env) Res<i32, Error> {
             input_tail_bytes: 600
         )
     ).try();
+    // Defers run in reverse registration order: close capture and native UI
+    // before joining noncancellable inference, while arena remains alive.
     @scope.defer(() { app.close(); });
-    transcriber ::= Transcriber.open(env, arena).try();
-    @scope.defer(() { transcriber.close(); });
-    // Stop capture before waiting for any noncancellable inference on exit.
-    @scope.defer(() { app.microphone.stop(); });
     model = load_model(env, arena).try();
     app.microphone.continuous(
         model.match({Ok(path) => path.len > 0, None => false})
@@ -100,26 +99,29 @@ run = (env: Env) Res<i32, Error> {
             levels     = arena.realloc<f64>(null_ptr<f64>(), 32).try();
             targets    = arena.realloc<f64>(null_ptr<f64>(), 32).try();
             Range(0, 32).loop((i) { levels.write(i, 0.0); targets.write(i, 0.0); });
-            last_frame ::= monotonic();
+            last_frame ::= env.clock.since_start().ns;
             smoke       = env.argv.find(
                 (arg) { arg.eq("--smoke") }
             ).match({Ok(_) => true, None => false});
             voice_smoke = env.argv.find(
                 (arg) { arg.eq("--voice-smoke") }
             ).match({Ok(_) => true, None => false});
-            voice_ready ::= false;
+            voice_ready     ::= false;
+            voice_submitted ::= env.clock.since_start().ns;
             voice_smoke.then(() {
                 env.var("ZEN_TRANSCRIBE_WAV").match({
                     Ok(path) => env.fs.read(arena, path).match({
                         Ok(bytes) => decode(arena, bytes.view()).match({
                             Ok(audio) => model.match({
-                                Ok(path) => { transcriber.submit(
-                                    path,
-                                    0,
-                                    audio.samples,
-                                    audio.count,
-                                    audio.rate
-                                ).try(); },
+                                Ok(path) => {
+                                    voice_submitted = env.clock.since_start().ns;
+                                    transcriber.submit(
+                                        path,
+                                        0,
+                                        audio.samples,
+                                        audio.count,
+                                        audio.rate
+                                    ).try(); },
                                 None     => (),
                             }),
                             _         => (),
@@ -129,12 +131,12 @@ run = (env: Env) Res<i32, Error> {
                     None     => (),
                 });
             });
-            running          ::= true;
-            ticks            ::= 0;
+            running ::= true;
+            smoke_started = env.clock.since_start().ns;
             live             ::= Live();
             saved_generation ::= 0;
             overflow_shown   ::= false;
-            loop(running && (!smoke || ticks < 60) && (!voice_smoke || (ticks < 1800 && !voice_ready)), (
+            loop(running && (!smoke || (app.frames < 60 && env.clock.since_start().ns - smoke_started < 30000000000)) && (!voice_smoke || (env.clock.since_start().ns - smoke_started < 30000000000 && !voice_ready)), (
                 h
             ) {
                 scratch ::= env.mem.alloc();
@@ -146,8 +148,17 @@ run = (env: Env) Res<i32, Error> {
                     },
                     false => Range(0, 32).loop((i) { targets.write(i, 0.0); }),
                 });
-                now = monotonic();
-                smooth_levels(targets, levels, 32, now - last_frame);
+                now = env.clock.since_start().ns;
+                smooth_levels(
+                    targets,
+                    levels,
+                    32,
+                    (now - last_frame).to_i32().match({
+                        Ok(ns) => ns.to_f64() / 1000000000.0,
+                        // Smoothing snaps to target for gaps of one second or more.
+                        None   => 1.0,
+                    })
+                );
                 last_frame = now;
                 app.spectrum(levels);
                 running = app.tick(scratch).try();
@@ -176,6 +187,7 @@ run = (env: Env) Res<i32, Error> {
 
                 transcriber.poll().try().match({
                     Ok(reply) => (voice_smoke || live.current(reply.session)).then(() {
+                        reply_received = env.clock.since_start().ns;
                         reply.success.match({
                             true  => {
                                 voice_ready = reply.text.len > 0;
@@ -186,6 +198,10 @@ run = (env: Env) Res<i32, Error> {
                                             reply.text
                                         ).try();
                                         println("Transcript: {}", reply.text);
+                                        println(
+                                            "zen-code: submit-to-reply {} ms (includes model load, actor delivery, inference and UI polling; excludes capture)",
+                                            (reply_received - voice_submitted) / 1000000
+                                        );
                                     },
                                     false => {
                                         reply.final.then(() {
@@ -277,11 +293,17 @@ run = (env: Env) Res<i32, Error> {
                     ).try();
                     overflow_shown = true;
                 });
-                ticks = ticks + 1;
             });
-            println("zen-code: {} Metal frames", app.frames);
+            println(
+                "zen-code: {} Metal frames · display link {} · submit {} FPS · p95 {} ms · p99 {} ms",
+                app.frames,
+                app.display_link(),
+                app.submission_fps(),
+                app.interval_p95_ms(),
+                app.interval_p99_ms()
+            );
             Ok(
-                (app.frames > 0 && (!voice_smoke || voice_ready)).match({true => 0, false => 1})
+                (app.frames > 0 && (!smoke || app.frames >= 60) && (!voice_smoke || voice_ready)).match({true => 0, false => 1})
             )
         },
     })
