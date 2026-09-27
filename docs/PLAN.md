@@ -57,7 +57,6 @@ Completed locally:
 - Benchmarks executed with the same compiler as the app; see BENCHMARKS.md.
 - Paused opaque compiler draft preserved, no compiler/seed changes included.
 
-Publication: extracted zen-voice is committed locally; creation of its new
-public GitHub repository requires explicit approval. Existing public library
-updates can be published under the earlier authorization. The app dependency
-migration is held locally until zen-voice is available remotely.
+Publication: with explicit approval, zen-voice commit 3295d07 is published at
+https://github.com/lantos1618/zen-voice. Existing public library updates are
+published. Zen Code's dependency migration is commit 3092b5d in zen-tui.
