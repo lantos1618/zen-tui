@@ -1,4 +1,4 @@
-Transcriber, Transcript, Live = transcription
+Transcriber, Transcript, Live, History = transcription
 Ptr, null_ptr = std.mem
 Audio, decode = parakeet.wav
 C = c.bind("unistd.h", { usleep* = (micros: u32) i32 })
@@ -99,8 +99,15 @@ receive = (session :: Transcriber) Res<Transcript> {
     result
 }
 
-exercise_live = (env: Env, a: Alloc, model: str, audio: Audio) i32 {
-    Transcriber.open(env, a).match({
+exercise_live = (
+    env   : Env,
+    a     : Alloc,
+    model : str,
+    audio : Audio
+) Res<i32, AllocError> {
+    history      ::= History.open(a).try();
+    first_length ::= 0;
+    outcome = Transcriber.open(env, a).match({
         Err(_)     => 20,
         Ok(opened) => {
             session ::= opened;
@@ -128,14 +135,15 @@ exercise_live = (env: Env, a: Alloc, model: str, audio: Audio) i32 {
                 },
             });
             good           = good && live.due(audio.count, false, session.busy);
-            accepted_final = session.snapshot(
+            accepted_final = session.segment(
                 model,
                 -1,
                 11,
                 audio.samples,
                 audio.count,
                 audio.rate,
-                true
+                true,
+                false
             ).match({Ok(v) => v, Err(_) => false});
             live.accepted(audio.count, false);
             good = good && accepted_final;
@@ -144,6 +152,40 @@ exercise_live = (env: Env, a: Alloc, model: str, audio: Audio) i32 {
                 Ok(final) => {
                     println("Final after busy: {}", final.text);
                     good = good && final.success && final.final && final.session == 11 && final.text.contains("quick brown fox") && final.text.contains("lazy dog");
+                    history.commit(a, final.text).try();
+                    first_length = history.view().len;
+                    good         = good && !final.ends_capture && live.committed(
+                        11,
+                        0,
+                        true
+                    ) && !live.finished;
+                },
+            });
+            accepted_second = session.segment(
+                model,
+                -1,
+                11,
+                audio.samples,
+                audio.count,
+                audio.rate,
+                true,
+                true
+            ).match({Ok(v) => v, Err(_) => false});
+            good            = good && accepted_second;
+            receive(session).match({
+                None      => { good = false; },
+                Ok(final) => {
+                    println("Second stable segment: {}", final.text);
+                    history.commit(a, final.text).try();
+                    good = good && final.success && final.final && final.ends_capture && final.count == audio.count && final.session == 11;
+                    good = good && history.view().len > first_length && history.view().contains(
+                        "quick brown fox"
+                    );
+                    good = good && live.committed(
+                        11,
+                        0,
+                        false
+                    ) && live.finished;
                     live.observe(12);
                     good = good && !live.current(final.session);
                 },
@@ -151,7 +193,8 @@ exercise_live = (env: Env, a: Alloc, model: str, audio: Audio) i32 {
             session.close();
             good.match({true => 0, false => 21})
         },
-    })
+    });
+    Ok(outcome)
 }
 
 // Repeat the known phrase with half-second silence between utterances. This
@@ -183,12 +226,12 @@ main = (env: Env) Res<i32, AllocError> {
             Ok(bytes) => decode(a, bytes.view()).match({
                 Err(_)    => Ok(8),
                 Ok(audio) => env.argv.get(3).match({Ok(flag) => flag.eq("--live"), None => false}).match({
-                  true  => Ok(exercise_live(
+                  true  => exercise_live(
                       env,
                       a,
                       model,
                       long_fixture(a, audio).try()
-                  )),
+                  ),
                   false => Ok(exercise(
                       env,
                       a,

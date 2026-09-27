@@ -52,3 +52,9 @@ build = (b :: Builder) Res<(), BuildError> {
         print('PASS: live partial contains quick; final contains quick brown fox and lazy dog')
     else:
         print('SKIP: real-model inference; supply --model MODEL.gguf --wav mono-float32.wav')
+
+    (target / 'main.zen').write_text((Path(__file__).parent / 'continuous_state.zen').read_text())
+    subprocess.run([str(args.zen.resolve()), 'build', '.'], cwd=target, env=env,
+                   check=True, timeout=120)
+    subprocess.run([str(target / 'check')], check=True, timeout=15)
+    print('PASS: 77.5-second continuous segmentation, exact tail accounting, history, and UTF-8 bounds')

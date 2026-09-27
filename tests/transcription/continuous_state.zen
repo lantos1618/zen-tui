@@ -1,0 +1,108 @@
+Live, History, quiet_tail = transcription
+
+main = (env: Env) Res<i32, AllocError> {
+    a = env.mem.alloc();
+    history ::= History.open(a).try();
+    live    ::= Live();
+    live.observe(41);
+    good ::= true;
+    // Five hard-boundary jobs: 75 seconds plus audio arriving during inference.
+    // Capture's actual append/discard is covered separately by the SDK fixture.
+    retained: usize  ::= 0;
+    captured: usize  ::= 0;
+    committed: usize ::= 0;
+    Range(0, 5).loop((segment) {
+        incoming  = 240000 - retained;
+        captured  = captured + incoming;
+        retained  = retained + incoming;
+        good      = good && live.due_segment(retained, true, false, false);
+        good      = good && live.finalize(retained, true, false);
+        submitted = live.segment_count(retained);
+        live.accepted_segment(submitted, true);
+        arrived  = (segment + 1) * 8000;
+        captured = captured + arrived;
+        retained = retained + arrived;
+        good     = good && !live.due_segment(retained, true, true, false);
+        good     = good && captured == committed + retained && submitted == 240000;
+        // Only successful, current-session replies may remove their exact prefix.
+        good      = good && live.current(41);
+        retained  = retained - submitted;
+        committed = committed + submitted;
+        active    = segment < 4;
+        good      = live.committed(41, retained, active) && good;
+        text      = segment.match({0 => "one", 1 => "two", 2 => "three", 3 => "four", _ => "five"});
+        history.commit(a, text).try();
+        good = good && captured == committed + retained && !live.finished;
+    });
+    good = good && committed == 1200000 && captured == 1240000 && retained == 40000;
+    good = good && history.view().eq("one two three four five");
+    // Stop happened while the fifth segment was decoding; its tail still needs
+    // one final request even though no new samples can now arrive.
+    good      = good && live.due_segment(retained, false, false, false);
+    submitted = live.segment_count(retained);
+    live.accepted_segment(submitted, false);
+    good      = good && !live.due_segment(retained, false, true, false);
+    retained  = retained - submitted;
+    committed = committed + submitted;
+    good      = live.committed(41, retained, false) && good;
+    history.commit(a, "final").try();
+    good     = good && live.finished && captured == committed && retained == 0;
+    good     = good && !live.due_segment(0, false, false, false);
+    good     = good && history.view().eq("one two three four five final");
+    rendered = history.render(a, "").try();
+    good     = good && rendered.view().eq(history.view());
+
+    // A late final from session 41 cannot reset admission for the next session.
+    live.observe(42);
+    history.reset();
+    live.accepted_segment(16000, true);
+    good = good && !live.committed(
+        41,
+        0,
+        false
+    ) && live.sent == 16000 && !live.finished;
+    good = good && !live.current(41) && live.current(42) && history.view().len == 0;
+    // Stop while a partial is busy, with an unchanged prefix, still finalizes.
+    good = good && !live.due_segment(16000, false, true, false);
+    good = good && live.due_segment(16000, false, false, false);
+    live.accepted_segment(16000, false);
+    good = live.committed(42, 0, false) && good;
+    good = good && live.finished;
+
+    live.observe(43);
+    good = good && !live.finalize(127999, true, true) && live.finalize(128000, true, true);
+    good = good && !live.finalize(128000, true, false) && live.finalize(240000, true, false);
+    good = good && live.segment_count(480000) == 240000;
+    live.fail();
+    good = good && !live.due_segment(480000, false, false, true);
+
+    // Partial rendering is provisional; it never mutates committed history.
+    history.commit(a, "stable").try();
+    partial = history.render(a, "temporary").try();
+    good    = good && partial.view().eq("stable temporary") && history.view().eq("stable");
+    history.reset();
+    unicode ::= a.String().try();
+    Range(0, 1200).loop((i) { unicode.add("界").try(); });
+    history.commit(a, unicode.view()).try();
+    trimmed = history.render(a, "").try();
+    good    = good && trimmed.view().starts_with("[Earlier text omitted]\n");
+    good    = good && history.view().len <= 3500 && history.view().len % 3 == 0;
+    Range(0, history.view().len / 3).loop((i) {
+        good = good && history.view().slice(i * 3, i * 3 + 3).eq("界");
+    });
+    history.reset();
+    good = good && history.render(a, "new session").try().view().eq("new session");
+
+    samples = a.realloc<f32>(null_ptr<f32>(), 5000).try();
+    Range(0, 5000).loop((i) { samples.write(i, 0.0); });
+    good = good && !quiet_tail(samples, 4799) && quiet_tail(samples, 5000);
+    samples.write(0, 1.0);
+    good = good && quiet_tail(samples, 5000);
+    Range(200, 5000).loop((i) { samples.write(i, 0.1); });
+    good = good && !quiet_tail(samples, 5000) && !quiet_tail(null_ptr<f32>(), 5000);
+    println(
+        "continuous sample accounting / finalization / UTF-8 history: {}",
+        good
+    );
+    Ok(good.match({true => 0, false => 1}))
+}

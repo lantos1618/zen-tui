@@ -29,3 +29,11 @@ half-second silent gaps. It requires recognizable words from a four-second
 prefix before simulated stop, then the expected phrase from the full recording.
 This is growing-context offline recognition, not native streaming. A two-second
 prefix of the short source recording can legitimately return no text.
+
+`continuous_state.zen` simulates 77.5 seconds over five finalized segments plus
+a stopped tail, checking exact count conservation and stale-session rejection.
+It also checks cumulative and provisional text, UTF-8-safe bounded history with
+an omission marker, and quiet-tail detection. The native live fixture sends two
+finalized segments through the same cached recognizer and verifies that both
+remain in stable history. Neither check records the microphone or restarts an
+existing window.

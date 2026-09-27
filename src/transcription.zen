@@ -19,7 +19,7 @@ Polling = c.bind("poll.h", "poll", {
 })
 
 MailboxError* = OpenFailed | ReadFailed | Closed
-Transcript* = { success*: bool, text*: str, session*: usize, final*: bool }
+Transcript* = { success*: bool, text*: str, session*: usize, final*: bool, ends_capture*: bool, count*: usize }
 
 // The UI admits one job until its complete reply arrives. The result actor
 // writes that reply; rejected result admission uses the worker error fallback.
@@ -178,6 +178,8 @@ Transcriber* = {
     busy* :: bool,
     inflight :: usize,
     inflight_final :: bool,
+    inflight_end :: bool,
+    inflight_count :: usize,
 
     open* = (env: Env, a: Alloc) Res<Transcriber, MailboxError
         | ActorStartError
@@ -214,7 +216,9 @@ Transcriber* = {
                     used: 0,
                     busy: false,
                     inflight: 0,
-                    inflight_final: true
+                    inflight_final: true,
+                    inflight_end: true,
+                    inflight_count: 0
                 )),
             }),
         })
@@ -236,6 +240,8 @@ Transcriber* = {
                 self.busy           = true;
                 self.inflight       = 0;
                 self.inflight_final = true;
+                self.inflight_end   = true;
+                self.inflight_count = count;
                 Ok(true)
             },
         })
@@ -256,9 +262,26 @@ Transcriber* = {
                 self.busy           = true;
                 self.inflight       = session;
                 self.inflight_final = finish;
+                self.inflight_end   = finish;
+                self.inflight_count = count;
                 Ok(true)
             },
         })
+    }
+
+    segment* = (self :: @Self, model: str, gpu: i32, session: usize, samples: Ptr<f32>, count: usize, rate: i32, finalize: bool, ends_capture: bool)
+               Res<bool, ActorError> {
+        accepted = self.snapshot(
+            model,
+            gpu,
+            session,
+            samples,
+            count,
+            rate,
+            finalize
+        ).try();
+        accepted.then(() { self.inflight_end = ends_capture; });
+        Ok(accepted)
     }
 
     // Returned text borrows this handle's buffer until the next submit/poll.
@@ -297,7 +320,9 @@ Transcriber* = {
                             success: self.buffer.read(0) != 'E',
                             text: str_at(self.buffer.offset(1), self.used - 2),
                             session: self.inflight,
-                            final: self.inflight_final
+                            final: self.inflight_final,
+                            ends_capture: self.inflight_end,
+                            count: self.inflight_count
                         )))
                     },
                 })
@@ -347,7 +372,105 @@ Live* = {
         self.finished = !active;
     }
 
+    // Quiet phrase boundaries after eight seconds; fifteen seconds is the
+    // hard bounded-context limit even if speech never pauses.
+    finalize* = (self: @Self, count: usize, active: bool, quiet: bool) bool {
+        !active || count >= 240000 || (count >= 128000 && quiet)
+    }
+
+    segment_count* = (self: @Self, count: usize) usize {
+        (count > 240000).match({true => 240000, false => count})
+    }
+
+    due_segment* = (self: @Self, count: usize, active: bool, busy: bool, quiet: bool) bool {
+        self.due(count, active, busy) || (self.session > 0 && !busy && !self.failed && !self.finished && count > 0 && self.finalize(count, active, quiet))
+    }
+
+    accepted_segment* = (self :: @Self, count: usize, active: bool) () {
+        self.accepted(count, active);
+    }
+
+    // Call only after a successful current-session final reply AND exact
+    // prefix removal. Any tail that arrived while decoding stays pending.
+    committed* = (self :: @Self, session: usize, remaining: usize, active: bool) bool {
+        self.current(session).match({
+            false => false,
+            true  => { self.sent = 0; self.finished = !active && remaining == 0; true },
+        })
+    }
+
     current* = (self: @Self, session: usize) bool { self.session == session }
 
     fail* = (self :: @Self) () { self.failed = true; }
+}
+
+quiet_tail* = (samples: Ptr<f32>, count: usize) bool {
+    (count < 4800 || samples.is_null()).match({
+        true  => false,
+        false => {
+            energy ::= 0.0;
+            Range(count - 4800, count).loop((i) {
+                value  = samples.read(i).to_f64();
+                energy = energy + value * value;
+            });
+            energy / 4800.0 < 0.00001
+        },
+    })
+}
+
+// Bounded main-thread display history, not a durable transcript. The buffer
+// never grows; scratch combinations are released at the end of a UI tick.
+History* = {
+    bytes: Ptr<u8>,
+    used :: usize,
+    trimmed :: bool,
+
+    open* = (a: Alloc) Res<History, AllocError> {
+        Ok(History(
+            bytes: a.realloc<u8>(null_ptr<u8>(), 3500).try(),
+            used: 0,
+            trimmed: false
+        ))
+    }
+    reset* = (self :: @Self) () { self.used = 0; self.trimmed = false; }
+    view* = (self: @Self) str { str_at(self.bytes, self.used) }
+
+    commit* = (self :: @Self, a: Alloc, text: str) Res<(), AllocError> {
+        combined     = a.String(
+            "{}{}{}",
+            self.view(),
+            (self.used > 0 && text.len > 0).match({true => " ", false => ""}),
+            text
+        ).try();
+        tail         = recent(combined.view(), 3500);
+        self.trimmed = self.trimmed || tail.len < combined.len();
+        self.bytes.copy_from(tail.ptr(), tail.len);
+        self.used = tail.len;
+        Ok(())
+    }
+
+    render* = (self: @Self, a: Alloc, partial: str) Res<String, AllocError> {
+        combined = a.String(
+            "{}{}{}",
+            self.view(),
+            (self.used > 0 && partial.len > 0).match({true => " ",false => ""}),
+            partial
+        ).try();
+        tail     = recent(combined.view(), 3500);
+        result ::= a.String().try();
+        (self.trimmed || tail.len < combined.len()).then(() {
+            result.add("[Earlier text omitted]\n").try();
+        });
+        result.add(tail).try();
+        Ok(result)
+    }
+}
+
+recent = (text: str, limit: usize) str {
+    start ::= (text.len > limit).match({true => text.len - limit,false => 0});
+    loop(
+        start < text.len && text.ptr().read(start) >= 128 && text.ptr().read(start) < 192,
+        (h) { start = start + 1; }
+    );
+    text.slice(start, text.len)
 }

@@ -1,5 +1,6 @@
 App, Config = macos
-Transcriber, Transcript, MailboxError, Live = transcription
+Transcriber, Transcript, MailboxError, Live, History, quiet_tail = transcription
+CAPTURE_OVERFLOW = macos.audio
 Error = AllocError | ActorStartError | ActorError | MailboxError
 Ptr, null_ptr = std.mem
 analyze, voice_bands, smooth_levels, encode_wav = audio
@@ -33,7 +34,8 @@ run = (env: Env) Res<i32, Error> {
             description: "LOCAL VOICE / METAL\n\nF2 starts/stops microphone capture.\nEnter speaks typed text · Escape closes.",
             prompt: "you › ",
             greeting: "Welcome to Zen TUI.",
-            spectrum_label: "Voice FFT 80 Hz–4 kHz"
+            spectrum_label: "Voice FFT 80 Hz–4 kHz",
+            input_tail_bytes: 600
         )
     ).try();
     @scope.defer(() { app.close(); });
@@ -42,6 +44,10 @@ run = (env: Env) Res<i32, Error> {
     // Stop capture before waiting for any noncancellable inference on exit.
     @scope.defer(() { app.microphone.stop(); });
     model = env.var("ZEN_PARAKEET_MODEL");
+    app.microphone.continuous(
+        model.match({Ok(path) => path.len > 0, None => false})
+    );
+    history ::= History.open(arena).try();
     model.match({
         Ok(_) => app.set_notice(
             arena,
@@ -91,10 +97,11 @@ run = (env: Env) Res<i32, Error> {
                     None     => (),
                 });
             });
-            running    ::= true;
-            ticks      ::= 0;
-            generation ::= 0;
-            live       ::= Live();
+            running          ::= true;
+            ticks            ::= 0;
+            live             ::= Live();
+            saved_generation ::= 0;
+            overflow_shown   ::= false;
             loop(running && (!smoke || ticks < 60) && (!voice_smoke || (ticks < 1800 && !voice_ready)), (
                 h
             ) {
@@ -112,57 +119,93 @@ run = (env: Env) Res<i32, Error> {
                 last_frame = now;
                 app.spectrum(levels);
                 running = app.tick(scratch).try();
+                (live.session != app.microphone.session()).then(
+                    () { history.reset(); overflow_shown = false; }
+                );
                 live.observe(app.microphone.session());
-                (app.microphone.generation() != generation).then(() {
-                    generation = app.microphone.generation();
-                    recording  = app.microphone.recording();
-                    (recording.count > 0).then(() {
-                        env.var("ZEN_RECORDING_PATH").match({
-                            Ok(path) => encode_wav(
-                                scratch,
-                                recording.data,
-                                recording.count,
-                                recording.rate
-                            ).match({
-                                Ok(wav) => env.fs.write(
-                                    path,
-                                    wav.view()
-                                ).match({
-                                    Ok(_) => println(
-                                        "Saved recording to {}",
-                                        path
-                                    ),
-                                    _     => println(
-                                        "Could not write recording"
-                                    ),
-                                }),
-                                _       => println(
-                                    "Could not encode recording"
-                                ),
-                            }),
-                            None     => (),
-                        });
+                (app.microphone.generation() != saved_generation).then(() {
+                    saved_generation = app.microphone.generation();
+                    model.match({
+                        Ok(_) => (),
+                        None  => {
+                            recording = app.microphone.recording();
+                            (recording.count > 0).then(
+                                () { save_segment(
+                                    env,
+                                    scratch,
+                                    recording.data,
+                                    recording.count,
+                                    recording.rate
+                                ); }
+                            );
+                        },
                     });
                 });
+
                 transcriber.poll().try().match({
                     Ok(reply) => (voice_smoke || live.current(reply.session)).then(() {
                         reply.success.match({
                             true  => {
-                                app.set_input(scratch, reply.text).try();
                                 voice_ready = reply.text.len > 0;
-                                voice_smoke.then(
-                                    () { println(
-                                        "Transcript: {}",
-                                        reply.text
-                                    ); }
-                                );
-                                app.set_notice(scratch, reply.final.match({
-                                    true  => "Parakeet local · transcription ready",
-                                    false => "Parakeet local · partial text, still listening…",
-                                })).try();
+                                voice_smoke.match({
+                                    true  => {
+                                        app.set_input(
+                                            scratch,
+                                            reply.text
+                                        ).try();
+                                        println("Transcript: {}", reply.text);
+                                    },
+                                    false => {
+                                        reply.final.then(() {
+                                            recording = app.microphone.recording();
+                                            (reply.count <= recording.count).match({
+                                                false => { live.fail(); app.microphone.stop(); },
+                                                true  => {
+                                                    history.commit(
+                                                        scratch,
+                                                        reply.text
+                                                    ).try();
+                                                    save_segment(
+                                                        env,
+                                                        scratch,
+                                                        recording.data,
+                                                        reply.count,
+                                                        recording.rate
+                                                    );
+                                                    app.microphone.discard_prefix(
+                                                        reply.count
+                                                    ).match({
+                                                        true  => { live.committed(
+                                                            reply.session,
+                                                            app.microphone.recording().count,
+                                                            app.microphone.active()
+                                                        ); },
+                                                        false => { live.fail(); app.microphone.stop(); },
+                                                    });
+                                                },
+                                            });
+                                        });
+                                        displayed = history.render(
+                                            scratch,
+                                            reply.final.match({true => "",false => reply.text})
+                                        ).try();
+                                        app.set_input(
+                                            scratch,
+                                            displayed.view()
+                                        ).try();
+                                    },
+                                });
+                                (!overflow_shown).then(() { app.set_notice(scratch,live.failed.match({
+                                    true  => "Recording stopped · could not preserve its audio boundary",
+                                    false => (live.finished || voice_smoke).match({
+                                        true  => "Parakeet local · transcription ready",
+                                        false => "Continuous dictation · text may revise until each phrase settles",
+                                    }),
+                                })).try(); });
                             },
                             false => {
                                 live.fail();
+                                app.microphone.stop();
                                 println("Transcription failed: {}", reply.text);
                                 app.set_notice(
                                     scratch,
@@ -176,18 +219,31 @@ run = (env: Env) Res<i32, Error> {
                 (running && !voice_smoke).then(() {
                     recording = app.microphone.recording();
                     active    = app.microphone.active();
-                    live.due(recording.count, active, transcriber.busy).then(() {
+                    chosen    = live.segment_count(recording.count);
+                    quiet     = !transcriber.busy && chosen >= 128000 && quiet_tail(
+                        recording.data,
+                        chosen
+                    );
+                    live.due_segment(recording.count, active, transcriber.busy, quiet).then(() {
+                        finalize = live.finalize(chosen, active, quiet);
                         model.match({
-                            Ok(path) => transcriber.snapshot(path, 0, live.session, recording.data, recording.count, 16000, !active).try().then(() {
-                                    live.accepted(recording.count, active);
-                                    app.set_notice(scratch,active.match({
-                                        true  => "Parakeet local · updating live partial…",
-                                        false => "Parakeet local · finishing latest recording…",
-                                    })).try();
-                                }),
+                            Ok(path) => transcriber.segment(path, 0, live.session, recording.data, chosen, 16000, finalize, !active && chosen == recording.count).try().then(() {
+                                live.accepted_segment(chosen, active);
+                                (!overflow_shown).then(() { app.set_notice(scratch,active.match({
+                                    true  => "Continuous dictation · updating local text…",
+                                    false => "Parakeet local · finishing latest recording…",
+                                })).try(); });
+                            }),
                             None     => (),
                         });
                     });
+                });
+                (app.microphone.status() == CAPTURE_OVERFLOW && !overflow_shown).then(() {
+                    app.set_notice(
+                        scratch,
+                        "Transcription fell behind · capture stopped; press F2 to retry"
+                    ).try();
+                    overflow_shown = true;
                 });
                 ticks = ticks + 1;
             });
@@ -197,4 +253,28 @@ run = (env: Env) Res<i32, Error> {
             )
         },
     })
+}
+
+// Explicit opt-in export overwrites the requested file with each completed
+// segment, not a claim that an unbounded dictation session fits one WAV.
+save_segment = (
+    env     : Env,
+    a       : Alloc,
+    samples : Ptr<f32>,
+    count   : usize,
+    rate    : u32
+) () {
+    env.var("ZEN_RECORDING_PATH").match({
+        None     => (),
+        Ok(path) => encode_wav(a, samples, count, rate).match({
+            Err(_)  => println("Could not encode recording segment"),
+            Ok(wav) => env.fs.write(path, wav.view()).match({
+                Ok(_)  => println(
+                    "Saved completed recording segment to {}",
+                    path
+                ),
+                Err(_) => println("Could not write recording segment"),
+            }),
+        }),
+    });
 }
