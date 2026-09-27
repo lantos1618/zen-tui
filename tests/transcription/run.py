@@ -13,7 +13,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--zen', type=Path, default=ROOT.parent / 'zen/zen')
 parser.add_argument('--sdk', type=Path, default=ROOT.parent / 'zen-parakeet/build/nemo-speech')
 parser.add_argument('--model', type=Path)
-parser.add_argument('--wav', type=Path)
+parser.add_argument('--wav', type=Path,
+                    help='Known 16 kHz mono float32 quick-brown-fox fixture from zen-parakeet/build/fixture.wav')
 args = parser.parse_args()
 if bool(args.model) != bool(args.wav):
     parser.error('--model and --wav must be provided together')
@@ -41,10 +42,13 @@ build = (b :: Builder) Res<(), BuildError> {
     subprocess.run([str(args.zen.resolve()), 'build', '.'], cwd=target, env=env,
                    check=True, timeout=120)
     subprocess.run([str(target / 'check')], check=True, timeout=150)
-    print('PASS: background model error, one-in-flight admission, polling, repeated close')
+    print('PASS: live scheduling, busy/final/stale handling, model error, admission, polling, repeated close')
     if args.model:
         subprocess.run([str(target / 'check'), str(args.model.resolve()), str(args.wav.resolve())],
                        check=True, timeout=150)
         print('PASS: real-model background transcription')
+        subprocess.run([str(target / 'check'), str(args.model.resolve()), str(args.wav.resolve()), '--live'],
+                       check=True, timeout=240)
+        print('PASS: live partial contains quick; final contains quick brown fox and lazy dog')
     else:
         print('SKIP: real-model inference; supply --model MODEL.gguf --wav mono-float32.wav')

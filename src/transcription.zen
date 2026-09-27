@@ -19,7 +19,7 @@ Polling = c.bind("poll.h", "poll", {
 })
 
 MailboxError* = OpenFailed | ReadFailed | Closed
-Transcript* = { success*: bool, text*: str }
+Transcript* = { success*: bool, text*: str, session*: usize, final*: bool }
 
 // The UI admits one job until its complete reply arrives. The result actor
 // writes that reply; rejected result admission uses the worker error fallback.
@@ -50,7 +50,8 @@ write_reply = (fd: i32, success: bool, text: str) () {
             length = length - 1;
         });
     });
-    write_all(fd, success.match({ true => "T", false => "E" })).then(() {
+    status = success.match({true => "T", false => "E"});
+    write_all(fd, status).then(() {
         write_all(fd, text.slice(0, length)).then(() { write_all(fd, "\0"); });
     });
 }
@@ -79,6 +80,7 @@ Worker = {
     results: Ref<Results>,
     fallback: i32,
     recognizer :: Res<Recognizer>,
+
 }
 
 Worker.impl(Actor, {
@@ -174,6 +176,8 @@ Transcriber* = {
     buffer: Ptr<u8>,
     used :: usize,
     busy* :: bool,
+    inflight :: usize,
+    inflight_final :: bool,
 
     open* = (env: Env, a: Alloc) Res<Transcriber, MailboxError
         | ActorStartError
@@ -208,7 +212,9 @@ Transcriber* = {
                     descriptor: descriptor,
                     buffer: buffer,
                     used: 0,
-                    busy: false
+                    busy: false,
+                    inflight: 0,
+                    inflight_final: true
                 )),
             }),
         })
@@ -226,8 +232,30 @@ Transcriber* = {
                     str_at(samples.to<u8>(), count * 4),
                     rate
                 ).try();
-                self.used = 0;
-                self.busy = true;
+                self.used           = 0;
+                self.busy           = true;
+                self.inflight       = 0;
+                self.inflight_final = true;
+                Ok(true)
+            },
+        })
+    }
+
+    snapshot* = (self :: @Self, model: str, gpu: i32, session: usize, samples: Ptr<f32>, count: usize, rate: i32, finish: bool)
+            Res<bool, ActorError> {
+        (self.busy || self.input < 0 || model.len == 0 || session == 0 || samples.is_null() || count == 0 || count > 480000).match({
+            true  => Ok(false),
+            false => {
+                self.worker.transcribe(
+                    model,
+                    gpu,
+                    str_at(samples.to<u8>(), count * 4),
+                    rate
+                ).try();
+                self.used           = 0;
+                self.busy           = true;
+                self.inflight       = session;
+                self.inflight_final = finish;
                 Ok(true)
             },
         })
@@ -266,8 +294,10 @@ Transcriber* = {
                     true  => {
                         self.busy = false;
                         Ok(Ok(Transcript(
-                            success: self.buffer.read(0) == 'T',
-                            text: str_at(self.buffer.offset(1), self.used - 2)
+                            success: self.buffer.read(0) != 'E',
+                            text: str_at(self.buffer.offset(1), self.used - 2),
+                            session: self.inflight,
+                            final: self.inflight_final
                         )))
                     },
                 })
@@ -288,4 +318,36 @@ Transcriber* = {
             self.busy   = false;
         });
     }
+}
+
+// Main-thread admission state: native work has one in-flight message, no queued
+// audio backlog. A new recording supersedes any previous session's reply.
+Live* = {
+    session* :: usize = 0,
+    sent* :: usize = 0,
+    finished* :: bool = false,
+    failed* :: bool = false,
+
+    observe* = (self :: @Self, session: usize) () {
+        (self.session != session).then(() {
+            self.session  = session;
+            self.sent     = 0;
+            self.finished = false;
+            self.failed   = false;
+        });
+    }
+
+    due* = (self: @Self, count: usize, active: bool, busy: bool) bool {
+        self.session > 0 && !busy && !self.failed && count > 0 && count >= self.sent &&
+            active.match({true => count - self.sent >= 16000, false => !self.finished})
+    }
+
+    accepted* = (self :: @Self, count: usize, active: bool) () {
+        self.sent     = count;
+        self.finished = !active;
+    }
+
+    current* = (self: @Self, session: usize) bool { self.session == session }
+
+    fail* = (self :: @Self) () { self.failed = true; }
 }

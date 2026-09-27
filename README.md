@@ -2,8 +2,9 @@
 
 A native macOS voice workspace written in Zen. F2 starts/stops microphone
 capture; the app displays a live FFT and measured Metal submission FPS. With a
-configured local Parakeet model, stopping a recording transcribes it in a Zen
-actor and puts the result in the input box. Enter speaks that text. Escape exits.
+configured local Parakeet model, a Zen actor revises the input text while you
+record and finishes the latest recording after you stop. Enter speaks that text.
+Escape exits.
 
 ## Libraries
 
@@ -53,10 +54,21 @@ if access is denied, enable it in System Settings > Privacy & Security >
 Microphone. Recording is off at startup and stops after 30 seconds or on F2.
 Samples stay local; no cloud transcription endpoint is used.
 
-Only one transcription is admitted at a time. A second recording stopped while
-the model is busy is not queued, and the app reports that state. Results use a
-bounded 4000-byte UTF-8 reply. Closing during inference waits for the accepted
-job to finish and releases the model. No native cancellation API is exposed yet.
+The current Parakeet TDT v3 encoder supports offline decoding, not the native
+streaming API. Live partials therefore decode growing, cumulative audio prefixes
+using the cached model. When the worker is idle and at least one more second of
+16 kHz audio is available, the app submits the latest prefix. Words can change
+as later context arrives, and short prefixes may return no text; this is not a
+stateful streaming decoder or a guaranteed one-second display latency.
+
+Only one inference is in flight. While it runs, audio keeps accumulating up to
+the existing 30-second capture bound; old intermediate prefixes are never queued.
+Stopping retains a final request for the latest complete audio, even if a partial
+is still busy or the sample count has not changed. Starting a new capture
+supersedes the previous session, and its late replies cannot overwrite new text.
+A model failure disables retries for that session; start a new capture to retry.
+Replies are bounded to 4000 UTF-8 bytes. Closing waits for accepted inference to
+finish and releases the model; native cancellation is not exposed.
 
 By default recordings are memory-only. To save each completed recording as a
 mono float32 WAV, set `ZEN_RECORDING_PATH` to an explicit writable path; each
@@ -76,25 +88,41 @@ app/ZenTUI.app/Contents/MacOS/ZenTUI --voice-smoke
 It waits at most 1800 event-loop ticks for a nonempty transcript, reports the
 text/frame count, and exits. Shutdown still drains accepted inference. Run
 `python3 tests/transcription/run.py` for the real-library asynchronous failure
-and mailbox lifecycle checks (SDK must be installed).
+and mailbox lifecycle checks (SDK must be installed). The same tests exercise
+live admission, deferred final requests, and stale session rejection. Add
+`--model ../zen-parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf
+--wav ../zen-parakeet/build/fixture.wav` to check a real partial and final against
+the known quick-brown-fox speech fixture.
 
-Validated locally: actual microphone start/activity/stop, 60-frame render smoke,
-FFT/WAV numerical checks in zen-audio, and a complete Metal transcription of a
-known speech fixture while the window submitted 630 frames. Fresh-install
-permission prompting and denied-to-authorized recovery were not UI-tested.
+Validated locally: 60-frame render smoke, FFT/WAV numerical checks in zen-audio,
+a recognizable partial from a four-second fixture prefix, and the full result
+from its 8.49-second recording. The updated app also completed the known speech
+fixture through Metal while submitting 38 frames. Microphone start/activity/stop
+was verified previously; this update used fixtures without restarting the live
+user window. Fresh-install permission prompting and denied-to-authorized recovery
+were not UI-tested.
 
 Metal clears/presents frames; Core Animation renders text and bars. FFT is
-scalar Zen with a Hann window and 32 linear frequency bands, displayed over a
-60 dB amplitude range. FPS counts frame submissions, not GPU completions. This
+scalar Zen with a Hann window. The voice display has 32 mel bands from 80 Hz to
+4 kHz, a −65 to −15 dBFS range, and elapsed-time smoothing with 35 ms attack and
+180 ms release. FPS counts frame submissions, not GPU completions. This
 is not yet a PTY terminal emulator, custom GPU glyph renderer, or SIMD library.
 
 ## Actor messages
 
-The UI sends copied PCM and model configuration to the inference actor. That
+The UI sends copied cumulative PCM and model configuration to the inference actor.
+The one in-flight request carries a capture session and partial/final identity
+on the main-thread handle; these remain attached until its reply is consumed. That
 actor sends a typed `deliver(success: bool, text: str)` message to the result
 actor; the runtime copies the text before inference scratch storage expires.
 The result actor bridges its messages to AppKit's main thread through the
-bounded nonblocking pipe mailbox. Neither actor touches window state. A rejected
+bounded pipe mailbox, polled with a zero timeout and partial-read framing. Neither actor touches window state. A rejected
 result-message admission reports an error through the bridge instead of leaving
-the UI waiting. Shutdown drains inference, then result delivery, then closes
+the UI waiting. Shutdown stops microphone capture, drains inference and result
+delivery, then closes
 the pipe. A general main-thread actor executor is not implemented yet.
+
+Actors currently run on pthread workers. AppKit and all rendering stay on the
+main thread; the input stream, model handle, scratch arenas, and copied message
+bytes have separate owners. This bridge is not a lock-free main-thread actor
+executor.

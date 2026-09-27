@@ -1,4 +1,4 @@
-Transcriber, Transcript = transcription
+Transcriber, Transcript, Live = transcription
 Ptr, null_ptr = std.mem
 Audio, decode = parakeet.wav
 C = c.bind("unistd.h", { usleep* = (micros: u32) i32 })
@@ -60,26 +60,145 @@ exercise = (
     })
 }
 
+schedule_checks = () bool {
+    live ::= Live();
+    live.observe(1);
+    good ::= !live.due(15999, true, false) && live.due(16000, true, false);
+    live.accepted(16000, true);
+    good = good && !live.due(32000, true, true) && live.due(32000, true, false);
+    // Stopping while partial work is in flight retains the latest final request.
+    good = good && !live.due(42000, false, true) && live.due(42000, false, false);
+    live.accepted(42000, false);
+    good = good && !live.due(42000, false, false) && live.current(1);
+    live.observe(2);
+    good = good && !live.current(1) && live.current(2) && live.sent == 0;
+    // An unchanged prefix still needs a final decode after its partial finishes.
+    live.accepted(16000, true);
+    good = good && live.due(16000, false, false);
+    live.fail();
+    good = good && !live.due(32000, true, false);
+    live.observe(3);
+    good && live.due(16000, true, false)
+}
+
+receive = (session :: Transcriber) Res<Transcript> {
+    result: Res<Transcript> ::= None;
+    attempts                ::= 0;
+    waiting                 ::= true;
+    loop(waiting && attempts < 120000, (h) {
+        session.poll().match({
+            Err(_)    => { waiting = false; },
+            Ok(reply) => reply.match({
+                None     => (),
+                Ok(text) => { result = Ok(text); waiting = false; },
+            }),
+        });
+        C.usleep(1000);
+        attempts = attempts + 1;
+    });
+    result
+}
+
+exercise_live = (env: Env, a: Alloc, model: str, audio: Audio) i32 {
+    Transcriber.open(env, a).match({
+        Err(_)     => 20,
+        Ok(opened) => {
+            session ::= opened;
+            live    ::= Live();
+            live.observe(11);
+            prefix   = (audio.count > 64000).match({true => 64000, false => audio.count});
+            accepted = session.snapshot(
+                model,
+                -1,
+                11,
+                audio.samples,
+                prefix,
+                audio.rate,
+                false
+            ).match({Ok(v) => v, Err(_) => false});
+            live.accepted(prefix, true);
+            good ::= accepted && !live.due(audio.count, false, session.busy);
+            receive(session).match({
+                None        => { good = false; },
+                Ok(partial) => {
+                    println("Partial before stop: {}", partial.text);
+                    good = good && partial.success && !partial.final && partial.session == 11 && partial.text.contains(
+                        "quick"
+                    );
+                },
+            });
+            good           = good && live.due(audio.count, false, session.busy);
+            accepted_final = session.snapshot(
+                model,
+                -1,
+                11,
+                audio.samples,
+                audio.count,
+                audio.rate,
+                true
+            ).match({Ok(v) => v, Err(_) => false});
+            live.accepted(audio.count, false);
+            good = good && accepted_final;
+            receive(session).match({
+                None      => { good = false; },
+                Ok(final) => {
+                    println("Final after busy: {}", final.text);
+                    good = good && final.success && final.final && final.session == 11 && final.text.contains("quick brown fox") && final.text.contains("lazy dog");
+                    live.observe(12);
+                    good = good && !live.current(final.session);
+                },
+            });
+            session.close();
+            good.match({true => 0, false => 21})
+        },
+    })
+}
+
+// Repeat the known phrase with half-second silence between utterances. This
+// keeps the simulated capture active while a four-second prefix is decoded.
+long_fixture = (a: Alloc, audio: Audio) Res<Audio, AllocError> {
+    count   = audio.count * 3 + 16000;
+    samples = a.realloc<f32>(null_ptr<f32>(), count).try();
+    Range(0, count).loop((i) { samples.write(i, 0.0); });
+    Range(0, 3).loop((i) {
+        samples.offset(i * (audio.count + 8000)).copy_from(audio.samples, audio.count);
+    });
+    Ok(Audio(samples: samples, count: count, rate: audio.rate))
+}
+
 main = (env: Env) Res<i32, AllocError> {
+    (!schedule_checks()).then(
+        () { println("live scheduling assertions failed"); }
+    );
     a ::= env.mem.alloc();
     model = env.argv.get(
         1
     ).match({Ok(path) => path, None => "/missing/zen-transcription-fixture.gguf"});
     wav   = env.argv.get(2).match({Ok(path) => path, None => ""});
-    (wav.len > 0).match({
+    (!schedule_checks()).match({
+      true  => Ok(19),
+      false => (wav.len > 0).match({
         true  => env.fs.read(a, wav).match({
             Err(_)    => Ok(7),
             Ok(bytes) => decode(a, bytes.view()).match({
                 Err(_)    => Ok(8),
-                Ok(audio) => Ok(exercise(
-                    env,
-                    a,
-                    model,
-                    audio.samples,
-                    audio.count,
-                    audio.rate,
-                    true
-                )),
+                Ok(audio) => env.argv.get(3).match({Ok(flag) => flag.eq("--live"), None => false}).match({
+                  true  => Ok(exercise_live(
+                      env,
+                      a,
+                      model,
+                      long_fixture(a, audio).try()
+                  )),
+                  false => Ok(exercise(
+                      env,
+                      a,
+                      model,
+                      audio.samples,
+                      audio.count,
+                      audio.rate,
+                      true
+                  )),
+                }),
             }),
         }),
         false => {
@@ -87,5 +206,6 @@ main = (env: Env) Res<i32, AllocError> {
             Range(0, 16000).loop((i) { samples.write(i, 0.0); });
             Ok(exercise(env, a, model, samples, 16000, 16000, false))
         },
+    })
     })
 }

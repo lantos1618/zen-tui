@@ -1,10 +1,10 @@
 App, Config = macos
-Transcriber, Transcript, MailboxError = transcription
+Transcriber, Transcript, MailboxError, Live = transcription
 Error = AllocError | ActorStartError | ActorError | MailboxError
 Ptr, null_ptr = std.mem
-analyze, bands, encode_wav = audio
+analyze, voice_bands, smooth_levels, encode_wav = audio
 Audio, decode = parakeet.wav
-log10 = std.math
+monotonic = macos.display
 
 main = (env: Env) Res<i32, Error> {
     help = env.argv.find((arg) { arg.eq("--help") || arg.eq("-h") }).match({
@@ -32,17 +32,20 @@ run = (env: Env) Res<i32, Error> {
             heading: "ZEN TUI",
             description: "LOCAL VOICE / METAL\n\nF2 starts/stops microphone capture.\nEnter speaks typed text · Escape closes.",
             prompt: "you › ",
-            greeting: "Welcome to Zen TUI."
+            greeting: "Welcome to Zen TUI.",
+            spectrum_label: "Voice FFT 80 Hz–4 kHz"
         )
     ).try();
     @scope.defer(() { app.close(); });
     transcriber ::= Transcriber.open(env, arena).try();
     @scope.defer(() { transcriber.close(); });
+    // Stop capture before waiting for any noncancellable inference on exit.
+    @scope.defer(() { app.microphone.stop(); });
     model = env.var("ZEN_PARAKEET_MODEL");
     model.match({
         Ok(_) => app.set_notice(
             arena,
-            "Parakeet local · record a phrase with F2"
+            "Parakeet local · live partials while recording with F2"
         ).try(),
         None  => app.set_notice(
             arena,
@@ -52,11 +55,14 @@ run = (env: Env) Res<i32, Error> {
     (!app.begin(arena).try()).match({
         true  => Ok(1),
         false => {
-            samples     = arena.realloc<f64>(null_ptr<f64>(), 1024).try();
-            real        = arena.realloc<f64>(null_ptr<f64>(), 1024).try();
-            imaginary   = arena.realloc<f64>(null_ptr<f64>(), 1024).try();
-            magnitudes  = arena.realloc<f64>(null_ptr<f64>(), 513).try();
-            levels      = arena.realloc<f64>(null_ptr<f64>(), 32).try();
+            samples    = arena.realloc<f64>(null_ptr<f64>(), 1024).try();
+            real       = arena.realloc<f64>(null_ptr<f64>(), 1024).try();
+            imaginary  = arena.realloc<f64>(null_ptr<f64>(), 1024).try();
+            magnitudes = arena.realloc<f64>(null_ptr<f64>(), 513).try();
+            levels     = arena.realloc<f64>(null_ptr<f64>(), 32).try();
+            targets    = arena.realloc<f64>(null_ptr<f64>(), 32).try();
+            Range(0, 32).loop((i) { levels.write(i, 0.0); targets.write(i, 0.0); });
+            last_frame ::= monotonic();
             smoke       = env.argv.find(
                 (arg) { arg.eq("--smoke") }
             ).match({Ok(_) => true, None => false});
@@ -88,56 +94,37 @@ run = (env: Env) Res<i32, Error> {
             running    ::= true;
             ticks      ::= 0;
             generation ::= 0;
+            live       ::= Live();
             loop(running && (!smoke || ticks < 60) && (!voice_smoke || (ticks < 1800 && !voice_ready)), (
                 h
             ) {
                 scratch ::= env.mem.alloc();
-                app.microphone.samples(samples);
-                analyze(samples, real, imaginary, magnitudes, 1024);
-                bands(magnitudes, 513, levels, 32);
-                Range(0, 32).loop((i) {
-                    amplitude = levels.read(i);
-                    db        = (amplitude > 0.001).match({true => (20.0 * log10(
-                        amplitude
-                    ) + 60.0) / 60.0, false => 0.0});
-                    levels.write(
-                        i,
-                        (db < 1.0).match({true => db, false => 1.0})
-                    );
+                app.microphone.active().match({
+                    true  => {
+                        app.microphone.samples(samples);
+                        analyze(samples, real, imaginary, magnitudes, 1024);
+                        voice_bands(magnitudes, 513, 16000, targets, 32);
+                    },
+                    false => Range(0, 32).loop((i) { targets.write(i, 0.0); }),
                 });
+                now = monotonic();
+                smooth_levels(targets, levels, 32, now - last_frame);
+                last_frame = now;
                 app.spectrum(levels);
                 running = app.tick(scratch).try();
+                live.observe(app.microphone.session());
                 (app.microphone.generation() != generation).then(() {
                     generation = app.microphone.generation();
                     recording  = app.microphone.recording();
                     (recording.count > 0).then(() {
-                        model.match({
-                            Ok(path) => transcriber.submit(
-                                path,
-                                0,
+                        env.var("ZEN_RECORDING_PATH").match({
+                            Ok(path) => encode_wav(
+                                scratch,
                                 recording.data,
                                 recording.count,
-                                16000
-                            ).try().match({
-                                true  => app.set_notice(
-                                    scratch,
-                                    "Transcribing locally with Parakeet…"
-                                ).try(),
-                                false => app.set_notice(
-                                    scratch,
-                                    "Model is busy · this recording was not submitted"
-                                ).try(),
-                            }),
-                            None     => (),
-                        });
-                        encode_wav(
-                            scratch,
-                            recording.data,
-                            recording.count,
-                            recording.rate
-                        ).match({
-                            Ok(wav) => env.var("ZEN_RECORDING_PATH").match({
-                                Ok(path) => env.fs.write(
+                                recording.rate
+                            ).match({
+                                Ok(wav) => env.fs.write(
                                     path,
                                     wav.view()
                                 ).match({
@@ -149,37 +136,58 @@ run = (env: Env) Res<i32, Error> {
                                         "Could not write recording"
                                     ),
                                 }),
-                                None     => println(
-                                    "Captured {} samples; set ZEN_RECORDING_PATH to save a WAV",
-                                    recording.count
+                                _       => println(
+                                    "Could not encode recording"
                                 ),
                             }),
-                            _       => println("Could not encode recording"),
+                            None     => (),
                         });
                     });
                 });
                 transcriber.poll().try().match({
-                    Ok(reply) => reply.success.match({
-                        true  => {
-                            app.set_input(scratch, reply.text).try();
-                            voice_ready = reply.text.len > 0;
-                            voice_smoke.then(
-                                () { println("Transcript: {}", reply.text); }
-                            );
-                            app.set_notice(
-                                scratch,
-                                "Parakeet local · transcription ready"
-                            ).try();
-                        },
-                        false => {
-                            println("Transcription failed: {}", reply.text);
-                            app.set_notice(
-                                scratch,
-                                "Transcription failed · check the model path and runtime log"
-                            ).try();
-                        },
+                    Ok(reply) => (voice_smoke || live.current(reply.session)).then(() {
+                        reply.success.match({
+                            true  => {
+                                app.set_input(scratch, reply.text).try();
+                                voice_ready = reply.text.len > 0;
+                                voice_smoke.then(
+                                    () { println(
+                                        "Transcript: {}",
+                                        reply.text
+                                    ); }
+                                );
+                                app.set_notice(scratch, reply.final.match({
+                                    true  => "Parakeet local · transcription ready",
+                                    false => "Parakeet local · partial text, still listening…",
+                                })).try();
+                            },
+                            false => {
+                                live.fail();
+                                println("Transcription failed: {}", reply.text);
+                                app.set_notice(
+                                    scratch,
+                                    "Transcription failed · check the model path and runtime log"
+                                ).try();
+                            },
+                        });
                     }),
                     None      => (),
+                });
+                (running && !voice_smoke).then(() {
+                    recording = app.microphone.recording();
+                    active    = app.microphone.active();
+                    live.due(recording.count, active, transcriber.busy).then(() {
+                        model.match({
+                            Ok(path) => transcriber.snapshot(path, 0, live.session, recording.data, recording.count, 16000, !active).try().then(() {
+                                    live.accepted(recording.count, active);
+                                    app.set_notice(scratch,active.match({
+                                        true  => "Parakeet local · updating live partial…",
+                                        false => "Parakeet local · finishing latest recording…",
+                                    })).try();
+                                }),
+                            None     => (),
+                        });
+                    });
                 });
                 ticks = ticks + 1;
             });
