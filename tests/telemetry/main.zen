@@ -1,0 +1,141 @@
+Telemetry, Buffer, TelemetryError = observability
+VoiceTrace, Transcript = voice
+Probe = c.bind("clock_probe.h", { reset* = () () count* = () u64 workers* = () u64 })
+main = (env: Env) Res<i32, AllocError | ActorStartError | TelemetryError> {
+    a          = env.mem.alloc();
+    enabled    = env.var(
+        "ZEN_TRACE_PATH"
+    ).match({Ok(p) => p.len > 0, None => false});
+    batch_test = env.var(
+        "ZEN_TRACE_BATCH_TEST"
+    ).match({Ok(_) => true, None => false});
+    Probe.reset();
+    telemetry ::= Telemetry.open(env, a).try();
+    first = telemetry.begin(env, "voice.synthetic");
+    good ::= true;
+    enabled.match({
+        false => {
+            telemetry.poll(env);
+            telemetry.complete(env, VoiceTrace(request: 99), false);
+            telemetry.end(env, true); telemetry.flush(env, a);
+            good = first.request == 0 && telemetry.snapshot().count == 0 && telemetry.snapshot().dropped == 0 && Probe.count() == 0 && Probe.workers() == 0;
+        },
+        true  => batch_test.match({
+          true  => {
+            // The first request was begun above: 7 complete requests = 35 spans.
+            telemetry.complete(
+                env,
+                VoiceTrace(
+                    request: first.request,
+                    enqueued: first.enqueued,
+                    started: first.enqueued,
+                    ended: first.enqueued,
+                    replied: first.enqueued
+                ),
+                false
+            );
+            Range(0, 6).loop((i) {
+                trace = telemetry.begin(env, "voice.batch");
+                telemetry.complete(
+                    env,
+                    VoiceTrace(
+                        request: trace.request,
+                        enqueued: trace.enqueued,
+                        started: trace.enqueued,
+                        ended: trace.enqueued,
+                        replied: trace.enqueued
+                    ),
+                    false
+                );
+            });
+            path     = env.var("ZEN_TRACE_PATH").value_or("");
+            deadline = env.clock.since_start().ns;
+            observed ::= false;
+            loop(!observed && env.clock.since_start().ns - deadline < 3000000000, (
+                h
+            ) {
+                scratch = env.mem.alloc();
+                env.fs.read(scratch, path).match({Err(_) => (), Ok(bytes) => { observed = bytes.view().ends_with("\n") && bytes.view().contains("spanId"); }});
+                (!observed).then(() { env.threads.sleep(1); });
+            });
+            good = observed && telemetry.snapshot().count == 35;
+            // Force a partial batch while the exporter remains alive.
+            env.threads.sleep(1001);
+            telemetry.poll(env);
+            poll_started = env.clock.since_start().ns;
+            partial ::= false;
+            loop(!partial && env.clock.since_start().ns - poll_started < 3000000000, (
+                h
+            ) {
+                scratch = env.mem.alloc();
+                env.fs.read(scratch, path).match({Err(_) => (), Ok(bytes) => {
+                    lines ::= 0;
+                    bytes.view().split('\n').loop((line) { (line.len > 0).then(() { lines = lines + 1; }); });
+                    partial = lines == 2;
+                }});
+                (!partial).then(() { env.threads.sleep(1); });
+            });
+            good = good && partial;
+            println(
+                "Partial async batch observed before shutdown: {}",
+                partial
+            );
+            println(
+                "Full async batch observed before final flush: {}",
+                observed
+            );
+            telemetry.flush(env, a); telemetry.flush(env, a);
+          },
+          false => {
+            telemetry.complete(
+                env,
+                VoiceTrace(
+                    request: first.request,
+                    enqueued: first.enqueued,
+                    started: first.enqueued,
+                    ended: first.enqueued,
+                    replied: first.enqueued
+                ),
+                false
+            );
+            good     = first.request > 0 && telemetry.snapshot().count == 5;
+            obsolete = telemetry.begin(env, "voice.abandoned");
+            current  = telemetry.begin(env, "voice.cancelled");
+            telemetry.complete(env, obsolete, false);
+            good = good && telemetry.snapshot().count == 6;
+            telemetry.complete(
+                env,
+                VoiceTrace(
+                    request: current.request,
+                    enqueued: current.enqueued,
+                    started: current.enqueued,
+                    ended: current.enqueued,
+                    replied: current.enqueued
+                ),
+                true
+            );
+            invalid = telemetry.begin(env, "voice.invalid_timing");
+            telemetry.complete(
+                env,
+                VoiceTrace(
+                    request: invalid.request,
+                    enqueued: invalid.enqueued,
+                    started: 0,
+                    ended: 0,
+                    replied: 0
+                ),
+                false
+            );
+            pending = telemetry.begin(env, "voice.pending_at_close");
+            telemetry.flush(env, a);
+            good = good && telemetry.snapshot().count == 13 && telemetry.snapshot().dropped == 0 && Probe.count() > 0;
+          },
+        }),
+    });
+    good = good && enabled.match({true => Probe.workers() == 2, false => Probe.workers() == 0});
+    println(
+        "Telemetry correlation, stale/cancelled spans, disabled clock calls: {}",
+        good
+    );
+    Ok(good.match({true => 0, false => 1}))
+}

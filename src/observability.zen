@@ -1,0 +1,229 @@
+Buffer*, Span = std.trace
+VoiceTrace, Transcript = voice
+Exporter, Stats, setup, submit = otel.exporter
+TelemetryError* = | SetupFailed
+StatsReporter = { last :: Stats = Stats(
+    accepted: 0,
+    exported: 0,
+    dropped: 0,
+    errors: 0,
+    batches: 0,
+    report_drops: 0
+) }
+StatsReporter.impl(Actor, {
+    receive = (self :: @Self, ctx: Context, stats: Stats) {
+        (stats.errors > self.last.errors).then(() {
+            println(
+                "Trace export failed: {} errors, {} dropped spans; inspect destination before starting a new run",
+                stats.errors,
+                stats.dropped
+            );
+        });
+        self.last = stats;
+    }
+    stopped = (self :: @Self, ctx: Context) {
+        stats = self.last;
+        println(
+            "Trace exporter: {} accepted, {} exported, {} dropped, {} errors, {} batches, {} report drops",
+            stats.accepted,
+            stats.exported,
+            stats.dropped,
+            stats.errors,
+            stats.batches,
+            stats.report_drops
+        );
+    }
+})
+// App-owned and opt-in. UI admits numeric spans; the exporter actor owns file I/O.
+Telemetry* = {
+    buffer :: Buffer, path: Res<str>, origin: u64, epoch: u64,
+    next :: u64, active :: u64 = 0, started :: u64, name :: str, pending :: bool,
+    worker :: Res<Ref<Exporter<StatsReporter>>> = None,
+    reporter :: Res<Ref<StatsReporter>> = None,
+    admission_dropped :: usize = 0,
+    closed :: bool = false,
+    last_poll :: u64 = 0,
+    open* = (env: Env, a: Alloc) Res<Telemetry, AllocError
+        | ActorStartError
+        | TelemetryError> {
+        path    = env.var("ZEN_TRACE_PATH");
+        enabled = path.match({Ok(p) => p.len > 0, None => false});
+        telemetry ::= Telemetry(
+            buffer: Buffer.create(
+                a,
+                enabled.match({true => 4096, false => 0})
+            ).try(),
+            path: path,
+            origin: enabled.match({true => env.clock.since_start().ns, false => 0}),
+            epoch: enabled.match({true => env.clock.unix().ns, false => 0}),
+            next: 1,
+            started: 0,
+            name: "",
+            pending: false
+        );
+        enabled.then(() {
+            reporter = env.spawn(StatsReporter()).try();
+            env.spawn(Exporter<StatsReporter>(reply: reporter)).match({
+                Err(error) => { reporter.stop(); reporter.join(); Err(
+                    error
+                ).try(); },
+                Ok(worker) => {
+                    path.match({None => (), Ok(destination) => {
+                        setup(
+                            worker,
+                            destination,
+                            "zen-code",
+                            telemetry.epoch,
+                            telemetry.origin + 1,
+                            telemetry.epoch
+                        ).match({
+                            Ok(_)  => { telemetry.worker = Ok(worker); telemetry.reporter = Ok(reporter); },
+                            Err(_) => {
+                                worker.stop(); worker.join(); reporter.stop(); reporter.join();
+                                Err(TelemetryError.SetupFailed).try();
+                            },
+                        });
+                    }});
+                },
+            });
+        });
+        Ok(telemetry)
+    }
+    // Reserve one root and four child IDs before crossing the actor boundary.
+    // Names are application constants; neither PCM nor transcript text is traced.
+    begin* = (self :: @Self, env: Env, name: str) VoiceTrace {
+        result ::= VoiceTrace();
+        self.path.match({None => (), Ok(p) => (!self.closed && p.len > 0 && self.next <= u64.MAX - 5).then(() {
+            self.end(env, true);
+            self.started = env.clock.since_start().ns;
+            self.name    = name; self.pending = true; self.active = self.next;
+            self.next = self.next + 5;
+            result    = VoiceTrace(
+                request: self.active,
+                enqueued: self.started
+            );
+        })});
+        result
+    }
+    record = (self :: @Self, id: u64, parent: u64, name: str, start: u64, end: u64, failed: bool) () {
+        self.buffer.record(Span(
+            id: id,
+            parent: parent,
+            name: name,
+            start_ns: start - self.origin,
+            end_ns: end - self.origin,
+            failed: failed
+        ));
+        self.worker.match({None => (), Ok(worker) => {
+            submit(
+                worker,
+                id,
+                parent,
+                name,
+                start - self.origin,
+                end - self.origin,
+                failed
+            ).match({
+                Ok(_)  => (),
+                Err(_) => { (self.admission_dropped < usize.MAX).then(
+                    () { self.admission_dropped = self.admission_dropped + 1; }
+                ); },
+            });
+        }});
+    }
+    complete* = (self :: @Self, env: Env, trace: VoiceTrace, failed: bool) () {
+        // An old result must never finish a newer request's span.
+        (self.pending && trace.request == self.active).then(() {
+            received = env.clock.since_start().ns;
+            valid    = trace.enqueued == self.started && trace.started >= trace.enqueued && trace.ended >= trace.started && trace.replied >= trace.ended && received >= trace.replied;
+            self.record(
+                self.active,
+                trace.parent,
+                self.name,
+                self.started,
+                received,
+                failed || !valid
+            );
+            valid.then(() {
+                self.record(
+                    self.active + 1,
+                    self.active,
+                    "voice.actor_queue",
+                    trace.enqueued,
+                    trace.started,
+                    false
+                );
+                self.record(
+                    self.active + 2,
+                    self.active,
+                    "voice.execution",
+                    trace.started,
+                    trace.ended,
+                    failed
+                );
+                self.record(
+                    self.active + 3,
+                    self.active,
+                    "voice.result_queue",
+                    trace.ended,
+                    trace.replied,
+                    false
+                );
+                self.record(
+                    self.active + 4,
+                    self.active,
+                    "voice.reply_to_ui",
+                    trace.replied,
+                    received,
+                    false
+                );
+            });
+            self.pending = false;
+        });
+    }
+    end* = (self :: @Self, env: Env, failed: bool) () {
+        self.pending.then(() {
+            self.record(
+                self.active,
+                0,
+                self.name,
+                self.started,
+                env.clock.since_start().ns,
+                failed
+            );
+            self.pending = false;
+        });
+    }
+    // Borrowed snapshot for inspection/export; the Telemetry owner retains storage.
+    snapshot* = (self: @Self) Buffer { self.buffer }
+
+    // UI polling requests a partial batch at most once per second. No retry or
+    // file I/O runs here; disabled telemetry never reads a clock. Full control
+    // messages are retried by the next poll interval, without delaying the UI.
+    poll* = (self :: @Self, env: Env) () {
+        self.worker.match({None => (), Ok(worker) => {
+            now = env.clock.since_start().ns;
+            (now >= self.last_poll && now - self.last_poll >= 1000000000).then(() {
+                self.last_poll = now;
+                worker.flush(); worker.snapshot();
+            });
+        }});
+    }
+
+    // Final drain. Producer admission ends before exporter.stop; the stats
+    // receiver stays alive through exporter.stopped's final scalar report.
+    flush* = (self :: @Self, env: Env, a: Alloc) () {
+        self.end(env, true); self.closed = true;
+        self.worker.match({None => (), Ok(worker) => {
+            worker.stop(); worker.join(); self.worker = None;
+            println(
+                "Trace producer: {} rejected submissions; {} inspection-buffer drops",
+                self.admission_dropped,
+                self.buffer.dropped
+            );
+        }});
+        self.reporter.match({None => (), Ok(reporter) => {
+            reporter.stop(); reporter.join(); self.reporter = None;
+        }});
+    }
+}

@@ -19,9 +19,13 @@ build = (b :: Builder) Res<(), BuildError> {
         "voice",
         {src: Path("../zen-voice/src/voice.zen"), libs: [], paths: []}
     ).try();
+    otel     = b.lib(
+        "otel",
+        {src: Path("../zen-otel/src/otel.zen"), libs: [], paths: []}
+    ).try();
     b.exe("zen-code", {
         src: Path("src/main.zen"),
-        deps: [macos, audio, parakeet, voice],
+        deps: [macos, audio, parakeet, voice, otel],
         language: "objective-c",
         frameworks: [
             "AppKit", "Foundation", "QuartzCore", "Metal", "AVFoundation",

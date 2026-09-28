@@ -1,10 +1,11 @@
+Telemetry, Buffer, TelemetryError = observability
 App, Config = macos
 Transcriber, Transcript, MailboxError, Live, quiet_tail = voice
 History, recent_text = history
 Editor, DocumentError = editor
 load_model, configure_model = config
 CAPTURE_OVERFLOW = macos.audio
-Error = AllocError | ActorStartError | ActorError | MailboxError | DocumentError
+Error = TelemetryError | AllocError | ActorStartError | ActorError | MailboxError | DocumentError
 Ptr, null_ptr = std.mem
 analyze, voice_bands, smooth_levels = audio
 Exporter, MAX_EXPORT_SAMPLES = export
@@ -64,6 +65,15 @@ main = (env: Env) Res<i32, Error> {
 
 run = (env: Env) Res<i32, Error> {
     arena       ::= env.mem.alloc();
+    telemetry   ::= Telemetry.open(env, arena).try();
+    result = run_session(env, arena, telemetry);
+    telemetry.flush(env, arena);
+    result
+}
+
+// Return through the owner so cleanup observes current telemetry state. Deferred
+// closures capture values, which would freeze the initial pending-span fields.
+run_session = (env: Env, arena: Alloc, telemetry :: Telemetry) Res<i32, Error> {
     transcriber ::= Transcriber.open(env, arena).try();
     @scope.defer(() { transcriber.close(); });
     exporter: Res<Exporter> = env.var("ZEN_RECORDING_PATH").match({
@@ -130,7 +140,8 @@ run = (env: Env) Res<i32, Error> {
                 model.match({
                     Ok(path) => (path.len > 0).then(() {
                         app.allow_capture(false);
-                        transcriber.prepare(path, 0).try();
+                        transcriber.tracing(telemetry.begin(env, "voice.prepare_to_reply"));
+                        (!transcriber.prepare(path, 0).try()).then(() { telemetry.end(env, true); });
                         app.set_notice(
                             arena,
                             "Loading and warming local model · microphone starts when ready"
@@ -149,6 +160,7 @@ run = (env: Env) Res<i32, Error> {
                 h
             ) {
                 scratch ::= env.mem.alloc();
+                telemetry.poll(env);
                 app.microphone.active().match({
                     true  => {
                         app.microphone.samples(samples);
@@ -205,7 +217,11 @@ run = (env: Env) Res<i32, Error> {
                 });
 
                 transcriber.poll().try().match({
-                    Ok(reply) => reply.preparation.match({
+                    Ok(reply) => { telemetry.complete(
+                        env,
+                        reply.trace,
+                        !reply.success || (!reply.preparation && !voice_smoke && !live.current(reply.session))
+                    ); reply.preparation.match({
                         true  => {
                             model_ready = reply.success;
                             app.allow_capture(reply.success);
@@ -217,6 +233,10 @@ run = (env: Env) Res<i32, Error> {
                                     ).try();
                                     voice_smoke.then(() {
                                         voice_submitted = env.clock.since_start().ns;
+                                        transcriber.tracing(telemetry.begin(
+                                            env,
+                                            "voice.fixture_to_reply"
+                                        ));
                                         submit_fixture(
                                             env,
                                             scratch,
@@ -331,7 +351,7 @@ run = (env: Env) Res<i32, Error> {
                             },
                         });
                     }),
-                    }),
+                    }); },
                     None      => (),
                 });
                 (running && !voice_smoke && model_ready).then(() {
@@ -345,13 +365,17 @@ run = (env: Env) Res<i32, Error> {
                     live.due_segment(recording.count, active, transcriber.busy, quiet).then(() {
                         finalize = live.finalize(chosen, active, quiet);
                         model.match({
-                            Ok(path) => transcriber.segment(path, 0, live.session, recording.data, chosen, 16000, finalize, !active && chosen == recording.count).try().then(() {
+                            Ok(path) => {
+                                transcriber.tracing(telemetry.begin(env, "voice.segment_to_reply"));
+                                admitted = transcriber.segment(path, 0, live.session, recording.data, chosen, 16000, finalize, !active && chosen == recording.count).try();
+                                (!admitted).then(() { telemetry.end(env, true); });
+                                admitted.then(() {
                                 live.accepted_segment(chosen, active);
                                 (!overflow_shown).then(() { app.set_notice(scratch,active.match({
                                     true  => "Continuous dictation · updating local text…",
                                     false => "Parakeet local · finishing latest recording…",
                                 })).try(); });
-                            }),
+                            }); },
                             None     => (),
                         });
                     });
@@ -378,6 +402,7 @@ run = (env: Env) Res<i32, Error> {
                 app.interval_p95_ms(),
                 app.interval_p99_ms()
             );
+            app.microphone.stop();
             Ok(
                 (app.frames > 0 && (!smoke || app.frames >= 60) && (!voice_smoke || voice_ready)).match({true => 0, false => 1})
             )
