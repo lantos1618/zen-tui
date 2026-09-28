@@ -44,8 +44,10 @@ samples (960 KB).
 
 `ZEN_RECORDING_PATH` creates a separate export actor. Admission copies the path
 and PCM before capture storage is discarded. Requests are capped at 480,000
-samples, with up to 64 pending messages: at most 122.9 MB of queued PCM, plus
-message overhead and working buffers. Each export uses a temporary arena for
+samples. The development actor compiler used for the current app caps active
+plus queued messages at 64 and 32 MiB including message overhead. Worker
+scratch/native allocations are additional. Rebuilding with the unpromoted
+regular compiler still gives the older count-only bound (122.9 MB queued PCM). Each export uses a temporary arena for
 aligned audio, WAV encoding, and same-directory atomic publication. Queue
 admission failures produce an app notice; encoding and filesystem failures log
 to the console. There is no export-completion reply or retry queue. Dictation may

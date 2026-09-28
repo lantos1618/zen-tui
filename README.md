@@ -41,15 +41,20 @@ verified model into `zen-parakeet/models`. These downloads are excluded from Git
 From this repository:
 
 ```sh
-ZEN_STD=../zen/src \
-CFLAGS="-O2 -I$PWD/../zen-parakeet/build/nemo-speech/include -Wl,-rpath,$PWD/../zen-parakeet/build/nemo-speech/lib" \
-../zen/zen build .
+tools/build-code.sh "$PWD/../zen/build/dev/actor-observe-zen"
 
 app/ZenCode.app/Contents/MacOS/ZenCode --set-model \
   "$PWD/../zen-parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf"
 app/ZenCode.app/Contents/MacOS/ZenCode --check-config
 open app/ZenCode.app
 ```
+
+The current telemetry integration requires the `actor-observe-zen` development
+compiler and matching sibling std sources. The regular compiler has not yet
+been promoted; a fresh clone alone does not reproduce this development setup.
+The build script requires an explicit absolute compiler path and records its
+hash, repository revisions and dirty state in `build/code-build-inputs.txt`.
+That inventory exposes local dependencies; it is not a dependency lockfile.
 
 The SDK paths are explicit build inputs. The current project builder does not
 fetch dependencies or infer include paths. Configure the local model once with
@@ -117,8 +122,11 @@ it does not contain the entire session. With transcription disabled, stopping
 the bounded recording saves the whole retained recording. No audio file is
 created by default. Encoding and atomic file publication run in a separate export
 actor. Admission copies the PCM before the capture buffer is reused; each request
-is capped at 480,000 samples and the runtime mailbox holds at most 64 pending
-messages (up to 122.9 MB of queued PCM in the worst case, plus working buffers).
+is capped at 480,000 samples. The app built with `zen/build/dev/actor-zen`
+limits each actor to 64 queued-or-executing messages and 32 MiB including
+message overhead; working buffers/native allocations are additional. The
+regular compiler has not yet been promoted and still uses the old count-only
+limit (up to 122.9 MB queued PCM).
 Accepted exports drain on shutdown, so slow storage can delay exit. Queue
 admission failures are reported by the app; encoding and filesystem failures are
 logged to the console. This optional export is not a durable full-session archive.
@@ -231,3 +239,59 @@ Ad-hoc signing is for local development; this is not Developer ID signing or
 notarization, and does not establish Gatekeeper acceptance or compatibility on a
 fresh Mac. Only the local Apple-silicon host has been tested. Native SDK/model
 redistribution terms still apply; model weights are not bundled or downloaded.
+
+The voice overlay shows the mean, lowest and highest accepted speaking pitch
+from the last three seconds (Hz). Silence is excluded and old readings expire.
+Deep (<130 Hz), mid (130–199 Hz) and high (200+ Hz) are descriptive app bands,
+not gender classifications or measured full vocal range. DSP lives in
+`zen-audio`; Zen Code samples it at 10 Hz and `zen-macos` displays the result.
+
+## Optional local traces
+
+Set `ZEN_TRACE_PATH=/absolute/path/voice-trace.ndjson` before launch. The opt-in
+exporter actor writes an OTLP JSON document every 32 completed spans; orderly
+exit drains a final partial batch. Output is append-only NDJSON, so use a fresh
+filename per run. Encoding and file I/O happen on the exporter worker, not the
+UI or capture callback. The file itself is not size-limited or rotated.
+
+Each model-preparation/transcription request has a correlated root and child
+spans for actor admission/queueing, worker execution, result delivery and UI
+receipt. Execution includes model load/copy/decode; result timing includes its
+actor queue and header preparation. Superseded, cancelled and unfinished requests
+are marked failed; stale IDs cannot complete a newer span. No transcript or audio
+payload is captured. Disabled telemetry allocates no span storage, starts no
+workers and reads no clocks (verified with native instrumentation).
+
+The exporter has bounded batching/mailbox storage. A full mailbox drops that
+telemetry submission without retrying on the UI thread. Final console counters
+report producer rejections and worker accepted/exported/dropped/error totals.
+A successful enqueue is not proof of export; file writes can fail or block,
+including during shutdown. A bounded 4,096-span inspection snapshot remains
+available separately; its contents are never exported a second time.
+
+See `../zen-otel/docs/EXPORTER.md` for limits and append/error semantics.
+Run `python3 tests/telemetry/run.py --zen ../zen/build/dev/actor-observe-zen` for
+synthetic correlation/OTLP/disabled-path/live-batch checks; no microphone or model
+is needed.
+
+See [the memory and actor audit](docs/MEMORY-ACTORS.md) for verified ownership
+contracts, current memory-budget gaps, focused checks and prioritized fixes.
+
+## Local call-style media experiment
+
+`zen-call` builds `build/ZenCall.app`: local camera preview plus bounded PCM
+transfer to a Zen actor. Run `tools/package-call.sh` after building; C starts
+the camera, F2 toggles microphone capture, and Escape closes. No networking,
+recording or speaker playback. See [the media experiment](docs/CALL.md) for
+build commands, ownership, live verification and remaining work.
+
+### Launch Zen Call on iOS Simulator
+
+Run `tools/launch-call-ios.sh` to build, install, and open the native iOS media
+experiment directly. Microphone PCM goes through the shared Zen audio actor.
+Simulator reports no camera; physical-device video integration is pending.
+See [Call details](docs/CALL.md).
+
+Low-volume tracing requests a partial-batch flush and status once per second
+while the UI runs. These control messages are best-effort under mailbox pressure;
+final drain still runs at shutdown. File-write errors are printed during the run.

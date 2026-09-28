@@ -1,0 +1,19 @@
+Builder, BuildError = std.build
+build = (b :: Builder) Res<(), BuildError> {
+    ui = b.lib("ui", {src: Path("../../../zen-ui/src/ui.zen"), libs: [], paths: []}).try();
+    ios = b.lib("ios", {src: Path("../../../zen-ios/src/ios.zen"), libs: ["objc"], paths: []}).try();
+    adapter = b.lib("ui_ios", {src: Path("../../../zen-ui/src/ios.zen"), libs: [], paths: []}).try();
+    b.exe("zen-call-ios", {
+        src: Path("../../src/call_ios.zen"), deps: [ui, ios, adapter],
+        language: "objective-c",
+        frameworks: ["UIKit", "Foundation", "QuartzCore", "AVFoundation", "AudioToolbox", "CoreFoundation"],
+        out: Ok(Path("../../build/zen-call-ios")),
+    }).try();
+    b.exe("zen-call-device", {
+        src: Path("../../src/call_ios.zen"), deps: [ui, ios, adapter],
+        language: "objective-c",
+        frameworks: ["UIKit", "Foundation", "QuartzCore", "AVFoundation", "AudioToolbox", "CoreFoundation"],
+        out: Ok(Path("../../build/zen-call-device")),
+    }).try();
+    Ok(())
+}

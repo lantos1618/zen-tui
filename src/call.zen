@@ -1,0 +1,223 @@
+analyze, voice_bands, smooth_levels = audio
+// Local media sandbox: camera preview and owned audio messages. No networking,
+// recording, speaker loopback, codec, or claim of AV synchronization.
+App, Config = macos
+Bridge, AudioWorker, BridgeError = call_audio
+camera_transport = call_transport
+Message, Rect, Point, Size = macos.native
+selector, text = macos.objc
+Ptr, null_ptr = std.mem
+str_at = std.text
+Error = AllocError | ActorStartError | ActorError | BridgeError
+main = (env: Env) Res<i32, Error> {
+    a                = env.mem.alloc();
+    smoke            = env.argv.find(
+        (arg) { arg.eq("--smoke") }
+    ).match({Ok(_) => true, None => false});
+    audio_check      = env.argv.find(
+        (arg) { arg.eq("--audio-check") }
+    ).match({Ok(_) => true, None => false});
+    camera_requested = env.argv.find(
+        (arg) { arg.eq("--camera") }
+    ).match({Ok(_) => true, None => false});
+    bridge           = Bridge.open(a).try();
+    @scope.defer(() { bridge.close(); });
+    audio = env.spawn(AudioWorker(output: bridge.output())).try();
+    @scope.defer(() { audio.stop(); audio.join(); });
+    app ::= App.configured(
+        a,
+        Config(
+            title: "Zen Call · Local Media Lab",
+            width: 960.0,
+            height: 720.0,
+            heading: "ZEN CALL · LOCAL MEDIA LAB",
+            description: "C starts camera · F2 toggles microphone · Escape closes\nLocal preview + audio actor transfer · no network or speaker playback",
+            prompt: "",
+            greeting: "",
+            editable: true,
+            spectrum_label: "Voice FFT 80 Hz–4 kHz",
+            show_voice_pitch: false
+        )
+    ).try();
+    @scope.defer(() { app.close(); });
+    preview = a.realloc<Ptr<()>>(null_ptr<Ptr<()>>(), 1).try();
+    preview.write(0, null_ptr<()>());
+    remove = selector(a, "removeFromSuperlayer").try();
+    camera = env.spawn(camera_transport.CameraWorker(
+        output: bridge.output(),
+        control: bridge.control()
+    )).try();
+    @scope.defer(() {
+        (!preview.read(0).is_null()).then(() { Message.void(preview.read(0), remove); });
+        bridge.stop_camera(); camera.stop(); camera.join();
+    });
+    app.microphone.continuous(true);
+    camera_started     ::= false;
+    camera_status: str ::= "Camera off";
+    (!smoke && camera_requested).then(
+        () { camera.run().try(); camera_started = true; camera_status = "Camera opening / permission pending"; }
+    );
+    app.begin(a).try();
+    (!smoke && audio_check).then(
+        () { println("Zen Call microphone start: {}", app.microphone.start()); }
+    );
+    samples = a.realloc<f32>(null_ptr<f32>(), 320).try();
+    Range(0, 320).loop((i) { samples.write(i, 0.25); });
+    sequence: u64 ::= 0; pending: u64 ::= 0;
+    sent: u64 ::= 0; received: u64 ::= 0; bytes: u64 ::= 0;
+    level: f64 ::= 0.0; dropped: usize ::= 0;
+    smoke.then(() { sequence = 1; pending = 1; audio.packet(
+        str_at(samples.to<u8>(), 1280),
+        1
+    ).try(); sent = 1;
+        // The worker must receive its own copy, even after source reuse.
+        Range(0, 320).loop((i) { samples.write(i, 0.0); });
+    });
+    notice = a.realloc<u8>(null_ptr<u8>(), 1024).try();
+    running ::= true;
+    start = env.clock.since_start().ns;
+    last_status: u64 ::= 0;
+    pending_since    ::= start;
+    transport_failed ::= false;
+    fft_samples = a.realloc<f64>(null_ptr<f64>(), 1024).try();
+    fft_real    = a.realloc<f64>(null_ptr<f64>(), 1024).try();
+    fft_imag    = a.realloc<f64>(null_ptr<f64>(), 1024).try();
+    magnitudes  = a.realloc<f64>(null_ptr<f64>(), 513).try();
+    targets     = a.realloc<f64>(null_ptr<f64>(), 32).try();
+    levels      = a.realloc<f64>(null_ptr<f64>(), 32).try();
+    Range(0, 32).loop((i) { levels.write(i, 0.0); targets.write(i, 0.0); });
+    last_audio: u64 ::= 0;
+    previous_frame  ::= start;
+    loop(running && (!audio_check || env.clock.since_start().ns - start < 12000000000) && (!smoke || (app.frames < 90 && env.clock.since_start().ns - start < 10000000000)), (
+        h
+    ) {
+        scratch = env.mem.alloc();
+        running = app.tick(scratch).try();
+        app.take_key().match({None => (), Ok(key) => {
+            (key.code == 53).then(() { running = false; });
+            (!smoke && key.code == 8 && !camera_started).then(() {
+                camera.run().try(); camera_started = true;
+                camera_status = "Camera opening / permission pending";
+            });
+        }});
+        reading ::= true;
+        Range(0, 8).loop((i) { reading.then(() {
+            bridge.poll().match({
+                Err(error) => error.match({Empty => { reading = false; }, _ => { Err(
+                    error
+                ).try(); }}),
+                Ok(reply)  => reply.kind.match({
+                    1 => { (reply.sequence == pending && pending != 0).then(() {
+                        received = received + 1; bytes = bytes + reply.bytes; level = reply.level; pending = 0; last_audio = env.clock.since_start().ns;
+                    }); },
+                    2 => { camera_status = "Waiting for camera permission"; },
+                    3 => {
+                        preview.write(0, reply.layer);
+                        Message.set_object(
+                            reply.layer,
+                            selector(scratch, "setVideoGravity:").try(),
+                            text(
+                                scratch,
+                                "AVLayerVideoGravityResizeAspect"
+                            ).try()
+                        );
+                        Message.set_object(
+                            app.content_layer(),
+                            selector(scratch, "addSublayer:").try(),
+                            reply.layer
+                        );
+                        camera_status = "Camera session running · local preview";
+                    },
+                    _ => { camera_status = "Camera unavailable or permission denied · restart to retry"; },
+                }),
+            });
+        }); });
+        (!smoke && !transport_failed).then(() {
+            recording = app.microphone.recording();
+            // Keep at most 400 ms pending; freshness wins over unbounded latency.
+            (recording.count > 6400).then(() {
+                excess = recording.count - 6400;
+                app.microphone.discard_prefix(
+                    excess
+                ); dropped = dropped + excess;
+            });
+            next = app.microphone.recording();
+            (pending == 0 && next.count >= 320).then(() {
+                candidate = sequence + 1;
+                audio.packet(
+                    str_at(next.data.to<u8>(), 1280),
+                    candidate
+                ).match({
+                    Ok(_)  => { sequence = candidate; pending = candidate; sent = sent + 1; pending_since = env.clock.since_start().ns; app.microphone.discard_prefix(
+                        320
+                    ); },
+                    Err(_) => { app.microphone.stop(); app.allow_capture(
+                        false
+                    ); transport_failed = true; },
+                });
+            });
+        });
+        (!preview.read(0).is_null()).then(() {
+            bounds = app.content_bounds(scratch).try();
+            width  = (bounds.size.width > 80.0).match({true => bounds.size.width - 40.0, false => 40.0});
+            height = (bounds.size.height > 380.0).match({true => bounds.size.height - 340.0, false => 40.0});
+            Message.set_rect(
+                preview.read(0),
+                selector(scratch, "setFrame:").try(),
+                Rect(
+                    origin: Point(x: 20.0, y: 120.0),
+                    size: Size(width: width, height: height)
+                )
+            );
+        });
+        now = env.clock.since_start().ns;
+        app.microphone.active().match({
+            true  => {
+                app.microphone.samples(fft_samples);
+                analyze(fft_samples, fft_real, fft_imag, magnitudes, 1024);
+                voice_bands(magnitudes, 513, 16000, targets, 32);
+            },
+            false => { Range(0, 32).loop((i) { targets.write(i, 0.0); }); },
+        });
+        // Cap elapsed to one second before checked conversion to i32/f64.
+        elapsed = now - previous_frame;
+        millis  = (elapsed > 1000000000).match({true => 1000, false => elapsed / 1000000});
+        seconds = millis.to_i32().match({Ok(value) => value.to_f64() / 1000.0, None => 1.0});
+        smooth_levels(targets, levels, 32, seconds);
+        app.spectrum(levels);
+        previous_frame = now;
+
+        (pending != 0 && now - pending_since > 2000000000 && !transport_failed).then(() {
+            transport_failed = true; app.microphone.stop(); app.allow_capture(
+                false
+            );
+        });
+        (now - last_status > 250000000).then(() {
+            label = scratch.String(
+                "{}\nAudio: {} sent / {} received · {} bytes · RMS {}/1000 · dropped {} samples · {}",
+                camera_status,
+                sent,
+                received,
+                bytes,
+                level,
+                dropped,
+                transport_failed.match({true => "TRANSFER FAILED · restart", false => app.microphone.active().match({false => "microphone off", true => (last_audio > 0 && now - last_audio < 1000000000).match({true => "receiving audio", false => "waiting for audio buffers"})})})
+            ).try();
+            (label.view().len <= 1024).ensure(BridgeError.NativeFailed).try();
+            label.view().copy_into(notice);
+            app.set_notice(scratch, str_at(notice, label.view().len)).try();
+            last_status = now;
+        });
+    });
+    println(
+        "Zen Call: {} frames; audio {} sent / {} received, {} bytes; camera requested {}",
+        app.frames,
+        sent,
+        received,
+        bytes,
+        camera_started
+    );
+    Ok(
+        ((!audio_check || received >= 10) && (!smoke || (received == 1 && bytes == 1280 && level == 250 && app.frames >= 90))).match({true => 0, false => 1})
+    )
+}

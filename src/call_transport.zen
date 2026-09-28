@@ -1,0 +1,81 @@
+// Camera ownership stays on the native camera actor.
+Ptr, null_ptr = std.mem
+PreviewSession, permission, Error = macos.camera
+create, selector = macos.objc
+Message = macos.native
+Reply, send = call_audio
+Native = c.bind("unistd.h", {
+    pipe* = (fds: Ptr<i32>) i32
+    read* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
+    write* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
+    close* = (fd: i32) i32
+    usleep* = (microseconds: u32) i32
+})
+Flags = c.bind("fcntl.h", { fcntl* = (fd: i32, command: i32, flags: i32) i32 })
+Errno = c.bind("errno.h", { __error* = () Ptr<i32> })
+CameraWorker* = { output: i32, control: i32,
+capture = (self: @Self, ctx: Context) Res<(), AllocError | Error> {
+    a       = ctx.env.mem.alloc();
+    release = selector(a, "release").try();
+    pool    = create(a, "NSAutoreleasePool").try();
+    @scope.defer(() { Message.void(pool, release); });
+    byte = a.realloc<u8>(null_ptr<u8>(), 1).try();
+    // This method executes on the camera actor, keeping start/stop off the UI.
+    session = PreviewSession.request(a).try();
+    @scope.defer(() { session.close(); });
+    send(
+        a,
+        self.output,
+        Reply(kind: 2, sequence: 0, bytes: 0, level: 0.0, layer: null_ptr<()>())
+    );
+    waiting ::= true; cancelled ::= false; allowed ::= false;
+    loop(waiting, (h) {
+        cancelled      = stopped(self.control, byte);
+        scratch        = ctx.env.mem.alloc();
+        iteration_pool = create(scratch, "NSAutoreleasePool").try();
+        @scope.defer(() { Message.void(iteration_pool, release); });
+        status  = permission(scratch).try();
+        allowed = status.match({Authorized => true, _ => false});
+        waiting = !cancelled && status.match({NotDetermined => true, _ => false});
+        waiting.then(() { Native.usleep(50000); });
+    });
+    (!cancelled).then(() {
+        allowed.ensure(Error.PermissionRequired).try();
+        session.start().try();
+        send(
+            a,
+            self.output,
+            Reply(
+                kind: 3,
+                sequence: 0,
+                bytes: 0,
+                level: 0.0,
+                layer: session.layer()
+            )
+        );
+        loop(!stopped(self.control, byte), (h) { Native.usleep(50000); });
+    });
+    Ok(())
+}
+}
+stopped = (fd: i32, byte: Ptr<u8>) bool {
+    count = Native.read(fd, byte, 1);
+    count == 0 || count == 1 || (count == usize.MAX && Errno.__error().read(0) != 35 && Errno.__error().read(0) != 4)
+}
+CameraWorker.impl(Actor, {
+    run = (self :: @Self, ctx: Context) {
+        self.capture(ctx).match({Ok(_) => (), Err(_) => {
+            send(
+                ctx.alloc,
+                self.output,
+                Reply(
+                    kind: 4,
+                    sequence: 0,
+                    bytes: 0,
+                    level: 0.0,
+                    layer: null_ptr<()>()
+                )
+            );
+        }});
+    }
+})

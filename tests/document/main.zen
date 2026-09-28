@@ -34,6 +34,23 @@ FailAfter.impl(Alloc, {
     }
 })
 
+// Reject oversized allocation requests before forwarding to the arena. This
+// turns accidental full-file reads into a deterministic regression failure.
+BoundedAlloc = { base: Alloc, peak: Ptr<usize>, limit: usize }
+BoundedAlloc.impl(Alloc, {
+    raw = (self: @Self, size: usize, align: usize) Res<Ptr<u8>, AllocError> {
+        (size <= self.limit).ensure(AllocError.OutOfMemory).try();
+        (size > self.peak.read(0)).then(() { self.peak.write(0, size); });
+        self.base.raw(size, align)
+    }
+    realloc = <T>(self: @Self, p: Ptr<T>, count: usize) Res<Ptr<T>, AllocError> {
+        size = p.bytes(count);
+        (size <= self.limit).ensure(AllocError.OutOfMemory).try();
+        (size > self.peak.read(0)).then(() { self.peak.write(0, size); });
+        self.base.realloc(p, count)
+    }
+})
+
 main = (env: Env) Res<i32, AllocError> {
     a = env.mem.alloc();
     Range(0, 6).loop((budget) {
@@ -178,6 +195,95 @@ main = (env: Env) Res<i32, AllocError> {
         ).match({Err(DocumentError.Io) => (), _ => { good = false; }});
         good = good && !env.fs.exists(file);
     }});
+    large = env.var(
+        "ZEN_DOCUMENT_LARGE_FILE"
+    ).match({Ok(value) => value, None => ""});
+    alias = env.var(
+        "ZEN_DOCUMENT_ALIAS"
+    ).match({Ok(value) => value, None => ""});
+    large_doc ::= Document.create(a, 65536).try();
+    peak = a.create<usize>().try();
+    peak.write(0, 0);
+    bounded = BoundedAlloc(base: a, peak: peak, limit: 65537);
+    large_doc.insert("kept").match({Ok(_) => (), Err(_) => { good = false; }});
+    large_doc.load(env, bounded, large).match({
+        Ok(_)      => { good = false; },
+        Err(error) => error.match({Capacity => (), _ => { good = false; }}),
+    });
+    good = good && peak.read(0) == 65537 && large_doc.view().eq("kept") && large_doc.path().len == 0;
+    exact ::= a.String().try();
+    Range(0, 65536).loop((i) { exact.add("x").try(); });
+    env.fs.write(
+        file,
+        exact.view()
+    ).match({Ok(_) => (), Err(_) => { good = false; }});
+    large_doc.load(
+        env,
+        bounded,
+        file
+    ).match({Ok(_) => (), Err(_) => { good = false; }});
+    good = good && large_doc.view().eq(exact.view()) && !large_doc.dirty();
+    large_doc.end();
+    good = good && large_doc.backspace();
+    exact.add("y").try();
+    env.fs.write(
+        file,
+        exact.view()
+    ).match({Ok(_) => (), Err(_) => { good = false; }});
+    large_doc.save(env, bounded).match({
+        Ok(_)      => { good = false; },
+        Err(error) => error.match({Conflict => (), _ => { good = false; }}),
+    });
+    disk = env.fs.read(
+        a,
+        file
+    ).match({Ok(value) => value.view(), Err(_) => ""});
+    good = good && disk.eq(
+        exact.view()
+    ) && large_doc.dirty() && large_doc.view().len == 65535;
+    env.fs.write(file, "").match({Ok(_) => (), Err(_) => { good = false; }});
+    empty ::= Document.create(a, 0).try();
+    empty.load(
+        env,
+        bounded,
+        file
+    ).match({Ok(_) => (), Err(_) => { good = false; }});
+    good = good && empty.view().len == 0 && !empty.dirty();
+    env.fs.write(file, "x").match({Ok(_) => (), Err(_) => { good = false; }});
+    empty.load(env, bounded, file).match({
+        Ok(_)      => { good = false; },
+        Err(error) => error.match({Capacity => (), _ => { good = false; }}),
+    });
+    large_doc.load(
+        env,
+        bounded,
+        alias
+    ).match({Ok(_) => (), Err(_) => { good = false; }});
+    good = good && large_doc.view().eq("linked");
+    large_doc.insert("edit ").match({Ok(_) => (), Err(_) => { good = false; }});
+    large_doc.save(env, bounded).match({
+        Ok(_)      => { good = false; },
+        Err(error) => error.match({Io => (), _ => { good = false; }}),
+    });
+    linked = env.fs.read(
+        a,
+        alias
+    ).match({Ok(value) => value.view(), Err(_) => ""});
+    good   = good && linked.eq("linked") && large_doc.dirty();
+    // Allocation failure leaves the old document and disk untouched.
+    left = a.create<usize>().try();
+    left.write(0, 0);
+    denied = FailAfter(base: a, left: left);
+    large_doc.load(env, denied, file).match({
+        Ok(_)      => { good = false; },
+        Err(error) => error.match({Io => (), _ => { good = false; }}),
+    });
+    good = good && large_doc.view().eq("edit linked");
+    env.fs.remove(file).match({Ok(_) => (), Err(_) => { good = false; }});
+    println(
+        "bounded reads/exact capacity/oversize/growth/empty/symlink/allocation failure: {}",
+        good
+    );
     println("document Unicode edit/undo/capacity/load/save/conflict: {}", good);
     Ok(good.match({true => 0, false => 1}))
 }

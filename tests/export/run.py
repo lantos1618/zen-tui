@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Compile the recording export actor and exercise copied PCM plus shutdown drain."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,9 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+parser = argparse.ArgumentParser()
+parser.add_argument("--zen", type=Path, default=ROOT.parent / "zen/zen")
+args = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix="zen-export-") as folder:
     work = Path(folder)
     (work / "main.zen").write_text((Path(__file__).parent / "main.zen").read_text())
@@ -22,6 +26,6 @@ build = (b :: Builder) Res<(), BuildError> {
 ''' % (json.dumps(str(ROOT.parent / "zen-macos/src/macos.zen")), json.dumps(str(ROOT.parent / "zen-audio/src/audio.zen")), json.dumps(str(ROOT / "src/export.zen"))))
     env = dict(os.environ, ZEN_STD=str(ROOT.parent / "zen/src"),
                ZEN_EXPORT_TEST_FILE=str(work / "recording.wav"), CFLAGS="-O2 -Wno-parentheses-equality")
-    subprocess.run([str(ROOT.parent / "zen/zen"), "build", "."], cwd=work,
+    subprocess.run([str(args.zen.resolve()), "build", "."], cwd=work,
                    env=env, check=True, timeout=120)
     subprocess.run([str(work / "check")], env=env, check=True, timeout=15)

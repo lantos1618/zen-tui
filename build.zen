@@ -33,6 +33,14 @@ build = (b :: Builder) Res<(), BuildError> {
         ],
         out: Ok(Path("app/ZenCode.app/Contents/MacOS/ZenCode")),
     }).try();
+    b.exe("zen-call", {
+        src: Path("src/call.zen"), deps: [macos, audio], language: "objective-c",
+        frameworks: [
+            "AppKit", "Foundation", "QuartzCore", "Metal", "AVFoundation",
+            "AudioToolbox", "CoreFoundation"
+        ],
+        out: Ok(Path("build/ZenCall.app/Contents/MacOS/ZenCall")),
+    }).try();
     b.exe("zen-package", {
         src: Path("tools/package.zen"),
         deps: [],

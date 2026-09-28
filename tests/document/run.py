@@ -19,8 +19,20 @@ build = (b :: Builder) Res<(), BuildError> {
     Ok(())
 }
 ''' % (json.dumps(str(ROOT.parent / "zen-macos/src/macos.zen")), json.dumps(str(ROOT / "src/document.zen"))))
+    large = work / "large.txt"
+    with large.open("wb") as stream:
+        stream.truncate(32 * 1024 * 1024)
+    target = work / "target.txt"
+    target.write_text("linked")
+    alias = work / "alias.txt"
+    alias.symlink_to(target)
     env = dict(os.environ, ZEN_STD=str(ROOT.parent / "zen/src"),
-               ZEN_DOCUMENT_TEST_FILE=str(work / "document.txt"), CFLAGS="-O2 -Wno-parentheses-equality")
+               ZEN_DOCUMENT_TEST_FILE=str(work / "document.txt"),
+               ZEN_DOCUMENT_LARGE_FILE=str(large), ZEN_DOCUMENT_ALIAS=str(alias), CFLAGS="-O2 -Wno-parentheses-equality")
     subprocess.run([str(ROOT.parent / "zen/zen"), "build", "."], cwd=work,
                    env=env, check=True, timeout=120)
     subprocess.run([str(work / "check")], env=env, check=True, timeout=15)
+    assert target.read_text() == "linked", "symlink target was overwritten"
+    assert alias.is_symlink(), "symlink was replaced"
+    assert large.stat().st_size == 32 * 1024 * 1024
+    assert not list(work.glob("*.zen-*")), "atomic save leaked staging files"

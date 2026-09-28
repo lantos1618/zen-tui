@@ -1,6 +1,6 @@
 Ptr, null_ptr = std.mem
 str_at, validate_utf8 = std.text
-replace, FileError = macos.file
+replace, read_bounded, FileError = macos.file
 
 DocumentError* = | Capacity
     | InvalidUtf8
@@ -173,15 +173,21 @@ Document* = {
             () { Err(DocumentError.PathTooLong).try(); }
         );
         (path.contains(0)).then(() { Err(DocumentError.InvalidPath).try(); });
-        contents = env.fs.read(scratch, path).match({Ok(value) => Ok(value), Err(_) => Err(DocumentError.Io)}).try();
-        (contents.len() > self.capacity).then(
+        contents = read_bounded(scratch, path, self.capacity).match({
+            Ok(value)  => Ok(value),
+            Err(error) => error.match({
+                FileError.TooLarge => Err(DocumentError.Capacity),
+                _                  => Err(DocumentError.Io),
+            }),
+        }).try();
+        (contents.len > self.capacity).then(
             () { Err(DocumentError.Capacity).try(); }
         );
-        validate_utf8(contents.view()).match({Ok(_) => (), Err(_) => { Err(DocumentError.InvalidUtf8).try(); }});
-        self.bytes.copy_from(contents.view().ptr(), contents.len());
-        self.baseline.copy_from(contents.view().ptr(), contents.len());
+        validate_utf8(contents).match({Ok(_) => (), Err(_) => { Err(DocumentError.InvalidUtf8).try(); }});
+        self.bytes.copy_from(contents.ptr(), contents.len);
+        self.baseline.copy_from(contents.ptr(), contents.len);
         self.path_bytes.copy_from(path.ptr(), path.len);
-        self.used = contents.len(); self.baseline_used = contents.len();
+        self.used = contents.len; self.baseline_used = contents.len;
         self.path_used = path.len; self.position = 0; self.can_undo = false;
         Ok(())
     }
@@ -191,8 +197,14 @@ Document* = {
     // macos.file stages and syncs bytes before replacing the destination.
     save* = (self :: @Self, env: Env, scratch: Alloc) Res<(), DocumentError> {
         (self.path_used == 0).then(() { Err(DocumentError.NoPath).try(); });
-        current = env.fs.read(scratch, self.path()).match({Ok(value) => Ok(value), Err(_) => Err(DocumentError.Io)}).try();
-        (!current.view().eq(str_at(self.baseline, self.baseline_used))).then(() { Err(DocumentError.Conflict).try(); });
+        current = read_bounded(scratch, self.path(), self.capacity).match({
+            Ok(value)  => Ok(value),
+            Err(error) => error.match({
+                FileError.TooLarge => Err(DocumentError.Conflict),
+                _                  => Err(DocumentError.Io),
+            }),
+        }).try();
+        (!current.eq(str_at(self.baseline, self.baseline_used))).then(() { Err(DocumentError.Conflict).try(); });
         replace(scratch, self.path(), self.view(), true).match({Ok(_) => (), Err(_) => { Err(DocumentError.Io).try(); }});
         self.baseline.copy_from(self.bytes, self.used);
         self.baseline_used = self.used;

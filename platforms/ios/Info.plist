@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>CFBundleExecutable</key><string>ZenCall</string>
+    <key>CFBundleIdentifier</key><string>dev.zen.call.ios</string>
+    <key>CFBundleName</key><string>Zen Call</string>
+    <key>CFBundleDisplayName</key><string>Zen Call</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>MinimumOSVersion</key><string>17.0</string>
+    <key>LSRequiresIPhoneOS</key><true/>
+    <key>UIDeviceFamily</key><array><integer>1</integer></array>
+    <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+    <key>UIUserInterfaceStyle</key><string>Dark</string>
+    <key>UILaunchScreen</key><dict/>
+<key>NSMicrophoneUsageDescription</key><string>Zen Call visualizes live microphone audio locally using Zen actors.</string>
+<key>NSCameraUsageDescription</key><string>Zen Call uses the camera for local video preview.</string>
+</dict></plist>

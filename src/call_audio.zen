@@ -1,0 +1,100 @@
+// Local media experiment. Fixed replies are atomic on Darwin pipes. Audio
+// payloads cross the actor mailbox as owned bytes, never borrowed sample pointers.
+Ptr, null_ptr = std.mem
+str_at = std.text
+sqrt = std.math
+Native = c.bind("unistd.h", {
+    pipe* = (fds: Ptr<i32>) i32
+    read* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
+    write* = (fd: i32, bytes: Ptr<u8>, count: usize) usize
+    close* = (fd: i32) i32
+    usleep* = (microseconds: u32) i32
+})
+Flags = c.bind("fcntl.h", { fcntl* = (fd: i32, command: i32, flags: i32) i32 })
+Errno = c.bind("errno.h", { __error* = () Ptr<i32> })
+// The only pointer transferred is a borrowed preview layer. The camera worker
+// retains ownership until UI detaches it and signals stop, then joins the worker.
+Reply* = { kind*: u64, sequence*: u64, bytes*: u64, level*: f64, layer*: Ptr<()> }
+BridgeError* = NativeFailed | Empty | Closed
+send* = (a: Alloc, fd: i32, value: Reply) () {
+    a.realloc<Reply>(null_ptr<Reply>(), 1).match({Err(_) => (), Ok(packet) => {
+        packet.write(0, value);
+        count ::= Native.write(fd, packet.to<u8>(), packet.bytes(1));
+        loop(
+            count == usize.MAX && Errno.__error().read(0) == 4,
+            (h) { count = Native.write(fd, packet.to<u8>(), packet.bytes(1)); }
+        );
+        a.free(packet);
+    }});
+}
+AudioWorker* = { output: i32 }
+AudioWorker.impl(Actor, {
+    packet = (self :: @Self, ctx: Context, pcm: str, sequence: u64) {
+        (pcm.len > 0 && pcm.len <= 1280 && pcm.len % 4 == 0).then(() {
+            a = ctx.env.mem.alloc();
+            a.realloc<f32>(
+                null_ptr<f32>(),
+                pcm.len / 4
+            ).match({Err(_) => (), Ok(samples) => {
+                samples.to<u8>().copy_from(pcm.ptr(), pcm.len);
+                sum ::= 0.0; count ::= 0.0;
+                Range(0, pcm.len / 4).loop((i) { value = samples.read(i).to_f64(); sum = sum + value * value; count = count + 1.0; });
+                rms = sqrt(sum / count);
+                // Clamp meter output; malformed/nonfinite PCM cannot overflow it.
+                level = (rms >= 0.0 && rms < 1.0).match({true => rms * 1000.0, false => (rms >= 1.0).match({true => 1000.0, false => 0.0})});
+                send(
+                    a,
+                    self.output,
+                    Reply(
+                        kind: 1,
+                        sequence: sequence,
+                        bytes: pcm.len.to_u64(),
+                        level: level,
+                        layer: null_ptr<()>()
+                    )
+                );
+            }});
+        });
+    }
+})
+
+Bridge* = {
+    fds: Ptr<i32>, packet: Ptr<Reply>,
+    open* = (a: Alloc) Res<Bridge, AllocError | BridgeError> {
+        fds    = a.realloc<i32>(null_ptr<i32>(), 4).try();
+        packet = a.realloc<Reply>(null_ptr<Reply>(), 1).try();
+        (Native.pipe(fds) == 0).ensure(BridgeError.NativeFailed).try();
+        good = Native.pipe(fds.offset(2)) == 0;
+        (!good).then(
+            () { Native.close(fds.read(0)); Native.close(fds.read(1)); }
+        );
+        good.ensure(BridgeError.NativeFailed).try();
+        nonblocking = Flags.fcntl(fds.read(0), 4, 4) == 0 && Flags.fcntl(fds.read(1), 4, 4) == 0 && Flags.fcntl(fds.read(2), 4, 4) == 0;
+        (!nonblocking).then(
+            () { Range(0, 4).loop((i) { Native.close(fds.read(i)); }); }
+        );
+        nonblocking.ensure(BridgeError.NativeFailed).try();
+        Ok(Bridge(fds: fds, packet: packet))
+    }
+    output* = (self: @Self) i32 { self.fds.read(1) }
+    control* = (self: @Self) i32 { self.fds.read(2) }
+    poll* = (self: @Self) Res<Reply, BridgeError> {
+        count = Native.read(
+            self.fds.read(0),
+            self.packet.to<u8>(),
+            self.packet.bytes(1)
+        );
+        (!(count == usize.MAX && (Errno.__error().read(0) == 35 || Errno.__error().read(0) == 4))).ensure(BridgeError.Empty).try();
+        (count == self.packet.bytes(1)).ensure(BridgeError.NativeFailed).try();
+        Ok(self.packet.read(0))
+    }
+    // EOF is reliable even when the bounded control pipe is full.
+    stop_camera* = (self: @Self) () {
+        (self.fds.read(3) >= 0).then(() { Native.close(self.fds.read(3)); self.fds.write(3, -1); });
+    }
+    // Only after camera and audio workers join, so no writer sees a dead reader.
+    close* = (self: @Self) () {
+        self.stop_camera();
+        Range(0, 4).loop((i) { (self.fds.read(i) >= 0).then(() { Native.close(self.fds.read(i)); self.fds.write(i, -1); }); });
+    }
+}

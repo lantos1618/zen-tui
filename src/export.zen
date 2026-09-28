@@ -53,7 +53,8 @@ Exporter* = {
         Ok(Exporter(worker: worker, path: owned.view(), closed: false))
     }
 
-    // The actor runtime bounds its pending mailbox at 64 messages. A request
+    // Actor capacity depends on the compiler runtime. The hardened candidate
+    // charges active + queued messages against 64 messages / 32 MiB. A request
     // is capped at 30 s of 16 kHz mono audio (1,920,000 PCM bytes). Full also
     // rejects invalid/oversized sample requests before touching their pointer.
     enqueue* = (self: @Self, samples: Ptr<f32>, count: usize, rate: u32)

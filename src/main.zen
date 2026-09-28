@@ -1,4 +1,7 @@
 Telemetry, Buffer, TelemetryError = observability
+estimate, Window = audio.pitch
+round = std.math
+monotonic = macos.display
 App, Config = macos
 Transcriber, Transcript, MailboxError, Live, quiet_tail = voice
 History, recent_text = history
@@ -126,7 +129,12 @@ run_session = (env: Env, arena: Alloc, telemetry :: Telemetry) Res<i32, Error> {
             levels     = arena.realloc<f64>(null_ptr<f64>(), 32).try();
             targets    = arena.realloc<f64>(null_ptr<f64>(), 32).try();
             Range(0, 32).loop((i) { levels.write(i, 0.0); targets.write(i, 0.0); });
-            last_frame ::= env.clock.since_start().ns;
+            pitch_scratch = arena.realloc<f64>(null_ptr<f64>(), 321).try();
+            pitch_window  ::= Window.create(arena).try();
+            pitch_time    ::= 0.0;
+            spectrum_time ::= 0.0;
+            pitch_session ::= app.microphone.session();
+            last_frame    ::= env.clock.since_start().ns;
             smoke       = env.argv.find(
                 (arg) { arg.eq("--smoke") }
             ).match({Ok(_) => true, None => false});
@@ -160,12 +168,16 @@ run_session = (env: Env, arena: Alloc, telemetry :: Telemetry) Res<i32, Error> {
                 h
             ) {
                 scratch ::= env.mem.alloc();
+                spectrum_now = monotonic();
                 telemetry.poll(env);
                 app.microphone.active().match({
                     true  => {
                         app.microphone.samples(samples);
-                        analyze(samples, real, imaginary, magnitudes, 1024);
-                        voice_bands(magnitudes, 513, 16000, targets, 32);
+                        (spectrum_now - spectrum_time >= 1.0 / 60.0).then(() {
+                            spectrum_time = spectrum_now;
+                            analyze(samples, real, imaginary, magnitudes, 1024);
+                            voice_bands(magnitudes, 513, 16000, targets, 32);
+                        });
                     },
                     false => Range(0, 32).loop((i) { targets.write(i, 0.0); }),
                 });
@@ -181,6 +193,24 @@ run_session = (env: Env, arena: Alloc, telemetry :: Telemetry) Res<i32, Error> {
                     })
                 );
                 last_frame = now;
+                pitch_now  = monotonic();
+                (pitch_session != app.microphone.session()).then(
+                    () { pitch_window.reset(); pitch_session = app.microphone.session(); }
+                );
+                (pitch_now - pitch_time >= 0.1).then(() {
+                    pitch_time = pitch_now;
+                    hz         = app.microphone.active().match({true => estimate(
+                        samples,
+                        pitch_scratch
+                    ), false => 0.0});
+                    pitch_window.record(pitch_now, hz);
+                    voice = pitch_window.summary(pitch_now);
+                    app.voice_pitch(
+                        round(voice.mean),
+                        round(voice.low),
+                        round(voice.high)
+                    );
+                });
                 app.spectrum(levels);
                 running = app.tick(scratch).try();
                 editor.enabled.then(() {

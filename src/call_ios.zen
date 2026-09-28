@@ -1,0 +1,156 @@
+// Native iOS Call experiment: UIKit + bounded PCM messages to the same audio
+// actor as macOS. No disk recording, speaker loopback, or network connection.
+Ptr, null_ptr = std.mem
+str_at, c_text = std.text
+callback = std.native
+platform = ios
+Message, Runtime = ios.native
+selector = ios.objc
+Capture = ios.audio_queue
+activate, deactivate = ios.audio
+available = ios.camera
+View, Error = ui
+Elements, TextStyle, WindowConfig, CompositionError = ui.elements
+Renderer, paint = ui_ios
+Bridge, AudioWorker, BridgeError = call_audio
+Failure = AllocError | Error | CompositionError | BridgeError | ActorStartError | ActorError
+Host = {
+    env: Env, view: View, capture: Capture, bridge: Bridge,
+    worker: Ref<AudioWorker>,
+    parent :: Ptr<()>, renderer :: Res<Renderer>,
+    target :: Ptr<()>, timer_target :: Ptr<()>, timer :: Ptr<()>,
+    microphone: usize, statistics: usize,
+    sequence :: u64 = 0, pending :: bool = false,
+    sent :: u64 = 0, received :: u64 = 0, bytes :: u64 = 0,
+    level :: f64 = 0.0, ticks :: u64 = 0,
+    since :: u64 = 0, failed :: bool = false,
+}
+update = (state :: Host, a: Alloc) Res<(), Failure> {
+    state.capture.poll();
+    state.bridge.poll().match({
+        Ok(reply) => {
+            (state.pending && reply.sequence == state.sequence).then(() {
+                state.pending = false;
+                state.received = state.received + 1;
+                state.bytes = state.bytes + reply.bytes;
+                state.level = reply.level;
+            });
+        },
+        Err(error) => error.match({Empty => (), _ => { state.failed = true; }}),
+    });
+    now = state.env.clock.since_start().ns;
+    (state.pending && now - state.since > 2000000000).then(() { state.failed = true; });
+    state.failed.then(() { state.capture.stop(); });
+    recording = state.capture.recording();
+    (!state.failed && !state.pending && state.capture.active() && recording.count >= 320).then(() {
+        state.sequence = state.sequence + 1;
+        state.worker.packet(str_at(recording.data.to<u8>(), 1280), state.sequence).try();
+        state.capture.discard_prefix(320);
+        state.sent = state.sent + 1;
+        state.pending = true;
+        state.since = now;
+    });
+    // Bound latency to 400 ms even if the actor or UI falls behind.
+    current = state.capture.recording();
+    (current.count > 6400).then(() { state.capture.discard_prefix(current.count - 6400); });
+    (state.ticks % 6 == 0).then(() {
+        status = state.failed.match({true => "Audio transport failed; restart app", false => state.capture.active().match({true => "Stop microphone", false => "Start microphone"})});
+        state.view.set_text(state.microphone, status).try();
+        meter = a.String("{} sent / {} received\n{} PCM bytes · level {}/1000\nCapture status: {}", state.sent, state.received, state.bytes, state.level, state.capture.status()).try();
+        state.view.set_text(state.statistics, meter.view()).try();
+        viewport = platform.viewport(a, state.parent).try();
+        state.view.reflow(viewport.width - viewport.safe_area.left - viewport.safe_area.right, viewport.height - viewport.safe_area.top - viewport.safe_area.bottom).try();
+        state.renderer.match({None => (), Ok(renderer) => renderer.refresh(a, state.view, viewport.safe_area.left, viewport.safe_area.top).try()});
+    });
+    state.ticks = state.ticks + 1;
+    Ok(())
+}
+pressed = (receiver: Ptr<()>, method: Ptr<()>, button: Ptr<()>) () {
+    pointer = platform.target_context(receiver).to<Host>();
+    (!pointer.is_null()).then(() {
+        state ::= pointer.read(0);
+        a = state.env.mem.alloc();
+        state.capture.active().match({
+            true => { println("Zen Call iOS stop: {}", state.capture.stop()); deactivate(a); state.level = 0.0; },
+            false => { (!state.failed).then(() {
+                activate(a).match({Ok(true) => { println("Zen Call iOS start: {}", state.capture.start()); }, _ => println("Zen Call iOS: audio session activation failed")});
+            }); },
+        });
+        pointer.write(0, state);
+    });
+}
+tick = (receiver: Ptr<()>, method: Ptr<()>, timer: Ptr<()>) () {
+    pointer = platform.target_context(receiver).to<Host>();
+    (!pointer.is_null()).then(() {
+        state ::= pointer.read(0);
+        update(state, state.env.mem.alloc()).match({Ok(_) => (), Err(_) => { state.failed = true; state.capture.stop(); }});
+        pointer.write(0, state);
+    });
+}
+// UIKit and queue callbacks share the main thread. Resume requires a tap.
+resign = (receiver: Ptr<()>, method: Ptr<()>, app: Ptr<()>) () {
+    pointer = platform.context(receiver).user.to<Host>();
+    state ::= pointer.read(0);
+    state.capture.stop();
+    deactivate(state.env.mem.alloc());
+    state.level = 0.0;
+    pointer.write(0, state);
+}
+setup = (pointer: Ptr<Host>, delegate: Ptr<()>) Res<(), Failure> {
+    state ::= pointer.read(0);
+    a = platform.context(delegate).arena;
+    state.parent = platform.show(platform.context(delegate), delegate).try().view;
+    pointer.write(0, state);
+    state.target = platform.target(a, "ZenCallButton", "pressed:", "v@:@", callback(pressed), pointer.to<()>()).try();
+    pointer.write(0, state);
+    state.renderer = Ok(Renderer.create(a, state.parent, state.view, state.target, selector(a, "pressed:").try()).try());
+    pointer.write(0, state);
+    update(state, a).try();
+    state.timer_target = platform.target(a, "ZenCallTimer", "tick:", "v@:@", callback(tick), pointer.to<()>()).try();
+    pointer.write(0, state);
+    state.timer = platform.timer(a, state.timer_target, "tick:", 1.0 / 60.0).try();
+    pointer.write(0, state);
+    println("Zen Call iOS ready: native UI + audio actor");
+    Ok(())
+}
+launch = (receiver: Ptr<()>, method: Ptr<()>, app: Ptr<()>, options: Ptr<()>) bool {
+    setup(platform.context(receiver).user.to<Host>(), receiver).match({Ok(_) => true, Err(_) => { println("Zen Call iOS setup failed"); false }})
+}
+main = (env: Env) Res<i32, Failure> {
+    a = env.mem.alloc();
+    bridge = Bridge.open(a).try();
+    @scope.defer(() { bridge.close(); });
+    worker = env.spawn(AudioWorker(output: bridge.output())).try();
+    @scope.defer(() { worker.stop(); worker.join(); });
+    capture = Capture.create(a).try();
+    capture.continuous(true);
+    @scope.defer(() { capture.stop(); deactivate(a); });
+    camera = available(a).try().match({true => "Camera detected. iOS preview integration pending.", false => "Camera unavailable on this device.\nSimulator has no camera preview."});
+    tree ::= Elements.create(a, 12).try();
+    window = tree.Window(WindowConfig(title: "Zen Call", width: 390.0, height: 650.0, padding: 20.0, gap: 12.0),
+        tree.Text(TextStyle(id: "title", height: 44.0, size: 30.0), "ZEN CALL").try(),
+        tree.Text(TextStyle(id: "subtitle", height: 42.0, size: 17.0), "iOS · Local media lab").try(),
+        tree.Text(TextStyle(id: "camera", height: 100.0, size: 19.0), camera).try(),
+        tree.Button(TextStyle(id: "microphone", height: 52.0, size: 20.0), 1, "Start microphone").try(),
+        tree.Text(TextStyle(id: "statistics", height: 110.0, size: 18.0), "Microphone off").try(),
+        tree.Text(TextStyle(id: "flow", height: 90.0, size: 16.0), "Microphone → owned PCM → Zen actor → UI\nLocal only · no speaker playback\nNo network call connected").try()
+    ).try();
+    view = tree.lower(a, window, window.width, window.height).try();
+    microphone = view.find("microphone").match({Ok(i) => Ok(i), None => Err(Error.InvalidNode)}).try();
+    statistics = view.find("statistics").match({Ok(i) => Ok(i), None => Err(Error.InvalidNode)}).try();
+    pointer = a.realloc<Host>(null_ptr<Host>(), 1).try();
+    pointer.write(0, Host(env: env, view: view, capture: capture, bridge: bridge, worker: worker, parent: null_ptr<()>(), renderer: None, target: null_ptr<()>(), timer_target: null_ptr<()>(), timer: null_ptr<()>(), microphone: microphone, statistics: statistics));
+    release = selector(a, "release").try();
+    invalidate = selector(a, "invalidate").try();
+    remove = selector(a, "removeFromSuperview").try();
+    @scope.defer(() {
+        state = pointer.read(0);
+        Runtime.objc_setAssociatedObject(state.timer_target, state.timer_target, null_ptr<()>(), 0);
+        Runtime.objc_setAssociatedObject(state.target, state.target, null_ptr<()>(), 0);
+        Message.void(state.timer, invalidate);
+        Message.void(state.timer, release);
+        state.renderer.match({None => (), Ok(r) => r.dispose(remove)});
+        Message.void(state.timer_target, release); Message.void(state.target, release);
+    });
+    Ok(platform.run_lifecycle(a, callback(launch), callback(resign), pointer.to<()>()).try())
+}
