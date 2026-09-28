@@ -11,7 +11,10 @@ ROOT = Path(__file__).resolve().parents[2]
 p = argparse.ArgumentParser()
 p.add_argument('--zen', type=Path, required=True)
 p.add_argument('--app', type=Path, help='Optional built native app: verify early-error cleanup before a window opens')
+p.add_argument('--render-smoke', action='store_true', help='Also open the app for a bounded native render/cleanup check')
 args = p.parse_args()
+if args.render_smoke and args.app is None:
+    p.error('--render-smoke requires --app')
 quote = lambda value: json.dumps(str(value))
 with tempfile.TemporaryDirectory(prefix='zen-telemetry-') as folder:
     work = Path(folder)
@@ -98,3 +101,13 @@ static int traced_clock_gettime(clockid_t id, struct timespec *ts) {
         assert early.stdout.count('Trace producer:') == 1, early.stdout
         assert early.stdout.count('Trace exporter:') == 1, early.stdout
         print('PASS: native early-error cleanup drains telemetry exactly once')
+
+        if args.render_smoke:
+            env['ZEN_TRACE_PATH'] = str(work / 'native-smoke.ndjson')
+            smoke = subprocess.run([str(args.app.resolve()), '--smoke'], env=env,
+                                   capture_output=True, text=True, timeout=45)
+            assert smoke.returncode == 0, smoke.stdout + smoke.stderr
+            assert '60 Metal frames' in smoke.stdout, smoke.stdout
+            assert smoke.stdout.count('Trace producer:') == 1, smoke.stdout
+            assert smoke.stdout.count('Trace exporter:') == 1, smoke.stdout
+            print('PASS: native render shutdown drains live telemetry once')

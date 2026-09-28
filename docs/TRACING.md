@@ -45,5 +45,6 @@ python3 tests/telemetry/run.py \
 
 The tests verify live full/partial batches, correlation, stale results, errors,
 shutdown, disabled worker/clock counts and native early-error cleanup. They do
-not load a model or record a microphone. `--smoke` is a separate native render
-check; 60 frames are not a sustained performance benchmark.
+not load a model or record a microphone. Add `--render-smoke` with `--app` to
+open a window for 60 frames and check normal shutdown exactly once. This caught
+a deferred-copy cleanup regression. It is not a sustained performance benchmark.
