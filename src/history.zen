@@ -15,7 +15,7 @@ History* = {
             trimmed: false
         ))
     }
-    reset* = (self :: @Self) () { self.used = 0; self.trimmed = false; }
+    reset* = (self :: @Self) { self.used = 0; self.trimmed = false; }
     view* = (self: @Self) str { str_at(self.bytes, self.used) }
 
     commit* = (self :: @Self, a: Alloc, text: str) Res<(), AllocError> {

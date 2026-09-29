@@ -43,7 +43,7 @@ Document* = {
     dirty* = (self: @Self) bool {
         !self.view().eq(str_at(self.baseline, self.baseline_used))
     }
-    remember = (self :: @Self) () {
+    remember = (self :: @Self) {
         self.previous.copy_from(self.bytes, self.used);
         self.previous_used     = self.used;
         self.previous_position = self.position;
@@ -69,7 +69,7 @@ Document* = {
         });
         Ok(())
     }
-    left* = (self :: @Self) () {
+    left* = (self :: @Self) {
         (self.position > 0).then(() {
             self.position = self.position - 1;
             loop(
@@ -78,7 +78,7 @@ Document* = {
             );
         });
     }
-    right* = (self :: @Self) () {
+    right* = (self :: @Self) {
         (self.position < self.used).then(() {
             self.position = self.position + 1;
             loop(
@@ -87,19 +87,19 @@ Document* = {
             );
         });
     }
-    home* = (self :: @Self) () {
+    home* = (self :: @Self) {
         loop(
             self.position > 0 && self.bytes.read(self.position - 1) != 10,
             (h) { self.left(); }
         );
     }
-    end* = (self :: @Self) () {
+    end* = (self :: @Self) {
         loop(
             self.position < self.used && self.bytes.read(self.position) != 10,
             (h) { self.right(); }
         );
     }
-    up* = (self :: @Self) () {
+    up* = (self :: @Self) {
         original = self.position;
         column: usize ::= 0;
         loop(
@@ -119,7 +119,7 @@ Document* = {
             },
         });
     }
-    down* = (self :: @Self) () {
+    down* = (self :: @Self) {
         original = self.position;
         column: usize ::= 0;
         loop(

@@ -65,7 +65,7 @@ update = (state :: Host, a: Alloc) Res<(), Failure> {
     state.ticks = state.ticks + 1;
     Ok(())
 }
-pressed = (receiver: Ptr<()>, method: Ptr<()>, button: Ptr<()>) () {
+pressed = (receiver: Ptr<()>, method: Ptr<()>, button: Ptr<()>) {
     pointer = platform.target_context(receiver).to<Host>();
     (!pointer.is_null()).then(() {
         state ::= pointer.read(0);
@@ -79,7 +79,7 @@ pressed = (receiver: Ptr<()>, method: Ptr<()>, button: Ptr<()>) () {
         pointer.write(0, state);
     });
 }
-tick = (receiver: Ptr<()>, method: Ptr<()>, timer: Ptr<()>) () {
+tick = (receiver: Ptr<()>, method: Ptr<()>, timer: Ptr<()>) {
     pointer = platform.target_context(receiver).to<Host>();
     (!pointer.is_null()).then(() {
         state ::= pointer.read(0);
@@ -88,7 +88,7 @@ tick = (receiver: Ptr<()>, method: Ptr<()>, timer: Ptr<()>) () {
     });
 }
 // UIKit and queue callbacks share the main thread. Resume requires a tap.
-resign = (receiver: Ptr<()>, method: Ptr<()>, app: Ptr<()>) () {
+resign = (receiver: Ptr<()>, method: Ptr<()>, app: Ptr<()>) {
     pointer = platform.context(receiver).user.to<Host>();
     state ::= pointer.read(0);
     state.capture.stop();

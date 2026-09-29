@@ -105,7 +105,7 @@ Telemetry* = {
         })});
         result
     }
-    record = (self :: @Self, id: u64, parent: u64, name: str, start: u64, end: u64, failed: bool) () {
+    record = (self :: @Self, id: u64, parent: u64, name: str, start: u64, end: u64, failed: bool) {
         self.buffer.record(Span(
             id: id,
             parent: parent,
@@ -131,7 +131,7 @@ Telemetry* = {
             });
         }});
     }
-    complete* = (self :: @Self, env: Env, trace: VoiceTrace, failed: bool) () {
+    complete* = (self :: @Self, env: Env, trace: VoiceTrace, failed: bool) {
         // An old result must never finish a newer request's span.
         (self.pending && trace.request == self.active).then(() {
             received = env.clock.since_start().ns;
@@ -181,7 +181,7 @@ Telemetry* = {
             self.pending = false;
         });
     }
-    end* = (self :: @Self, env: Env, failed: bool) () {
+    end* = (self :: @Self, env: Env, failed: bool) {
         self.pending.then(() {
             self.record(
                 self.active,
@@ -200,7 +200,7 @@ Telemetry* = {
     // UI polling requests a partial batch at most once per second. No retry or
     // file I/O runs here; disabled telemetry never reads a clock. Full control
     // messages are retried by the next poll interval, without delaying the UI.
-    poll* = (self :: @Self, env: Env) () {
+    poll* = (self :: @Self, env: Env) {
         self.worker.match({None => (), Ok(worker) => {
             now = env.clock.since_start().ns;
             (now >= self.last_poll && now - self.last_poll >= 1000000000).then(() {
@@ -212,7 +212,7 @@ Telemetry* = {
 
     // Final drain. Producer admission ends before exporter.stop; the stats
     // receiver stays alive through exporter.stopped's final scalar report.
-    flush* = (self :: @Self, env: Env, a: Alloc) () {
+    flush* = (self :: @Self, env: Env, a: Alloc) {
         self.end(env, true); self.closed = true;
         self.worker.match({None => (), Ok(worker) => {
             worker.stop(); worker.join(); self.worker = None;

@@ -16,7 +16,7 @@ Errno = c.bind("errno.h", { __error* = () Ptr<i32> })
 // retains ownership until UI detaches it and signals stop, then joins the worker.
 Reply* = { kind*: u64, sequence*: u64, bytes*: u64, level*: f64, layer*: Ptr<()> }
 BridgeError* = NativeFailed | Empty | Closed
-send* = (a: Alloc, fd: i32, value: Reply) () {
+send* = (a: Alloc, fd: i32, value: Reply) {
     a.realloc<Reply>(null_ptr<Reply>(), 1).match({Err(_) => (), Ok(packet) => {
         packet.write(0, value);
         count ::= Native.write(fd, packet.to<u8>(), packet.bytes(1));
@@ -89,11 +89,11 @@ Bridge* = {
         Ok(self.packet.read(0))
     }
     // EOF is reliable even when the bounded control pipe is full.
-    stop_camera* = (self: @Self) () {
+    stop_camera* = (self: @Self) {
         (self.fds.read(3) >= 0).then(() { Native.close(self.fds.read(3)); self.fds.write(3, -1); });
     }
     // Only after camera and audio workers join, so no writer sees a dead reader.
-    close* = (self: @Self) () {
+    close* = (self: @Self) {
         self.stop_camera();
         Range(0, 4).loop((i) { (self.fds.read(i) >= 0).then(() { Native.close(self.fds.read(i)); self.fds.write(i, -1); }); });
     }
